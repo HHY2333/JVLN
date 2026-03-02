@@ -164,6 +164,102 @@ class VGGTMerger(nn.Module):
         return x
 
 
+class ProgressiveSpatialCompressor(nn.Module):
+    """
+    渐进空间压缩模块（Progressive Spatial Compressor）。
+
+    参考 Efficient-VLN 论文中的渐进空间压缩思想：越久远的历史帧使用越大的
+    压缩比，以模拟人类记忆中"近期记忆清晰、远期记忆模糊"的渐进遗忘机制。
+
+    压缩策略（从最近到最远分组）：
+        - Group 0（最近 frames_per_group 帧）: pool_size = pool_sizes[0]
+          保留约 1 / pool_sizes[0]^2 的空间 token
+        - Group 1（次近 frames_per_group 帧）: pool_size = pool_sizes[1]
+          保留约 1 / pool_sizes[1]^2 的空间 token
+        - Group K（更早的帧）: pool_size = pool_sizes[K]
+          保留约 1 / pool_sizes[K]^2 的空间 token
+
+    默认设置 (pool_sizes=[2,4,8]) 对应：
+        最近帧 → 保留 1/4，次近帧 → 保留 1/16，更早帧 → 保留 1/64
+
+    注意：输入特征已经过 PatchMerger，空间维度以 merged-patch 为单位，
+    因此无需再除以 spatial_merge_size。
+
+    Args:
+        frames_per_group (int): 每个压缩级别覆盖的帧数，参考论文默认为 3。
+        pool_sizes (list[int]): 各压缩级别的空间下采样倍率，按从近到远排列。
+                                默认 [2, 4, 8]。
+    """
+
+    def __init__(self, frames_per_group: int = 3, pool_sizes: Optional[List[int]] = None):
+        super().__init__()
+        self.frames_per_group = frames_per_group
+        # 默认从近到远下采样倍率: 2×2(保留1/4), 4×4(保留1/16), 8×8(保留1/64)
+        self.pool_sizes = pool_sizes if pool_sizes is not None else [2, 4, 8]
+
+    def forward(
+        self,
+        frame_features: List[torch.Tensor],
+        frame_grids: List[Tuple[int, int]],
+    ) -> torch.Tensor:
+        """
+        对历史帧特征列表进行渐进空间压缩。
+
+        Args:
+            frame_features (list[Tensor]): 历史帧特征列表，按时间从旧到新排列
+                （oldest → newest）。每个元素 shape = [H_i * W_i, C]，其中
+                H_i、W_i 为经过 PatchMerger 后的有效空间网格尺寸。
+            frame_grids (list[tuple]): 与 frame_features 对应的 (H_i, W_i) 列表，
+                即 PatchMerger 之后每帧的空间网格（单位：merged-patch 数）。
+
+        Returns:
+            Tensor: 按时间从旧到新拼接的压缩特征，
+                    shape = [total_compressed_tokens, C]。
+        """
+        if len(frame_features) == 0:
+            # 无历史帧时返回空张量，形状与后续 cat 兼容
+            device = frame_features[0].device if frame_features else torch.device("cpu")
+            return torch.zeros(0, 0, device=device)
+
+        n_frames = len(frame_features)
+        C = frame_features[0].shape[-1]  # 通道维度（LLM hidden_size）
+
+        # ── 将输入反转为"最新帧优先"顺序，以便按距当前帧的时间距离分组 ──
+        reversed_features = list(reversed(frame_features))  # newest → oldest
+        reversed_grids    = list(reversed(frame_grids))
+
+        compressed_reversed = []
+        for i in range(n_frames):
+            feat = reversed_features[i]   # [H*W, C]
+            h, w = reversed_grids[i]      # effective spatial grid after PatchMerger
+
+            # 根据帧序号 i 确定压缩级别：i 越大（帧越旧）→ 压缩比越大
+            group_idx = min(i // self.frames_per_group, len(self.pool_sizes) - 1)
+            pool_size = self.pool_sizes[group_idx]
+
+            # ── 把 patch 序列 reshape 为 2D 空间格式，方便做自适应平均池化 ──
+            # [H*W, C] → [H, W, C] → [C, H, W] → [1, C, H, W]
+            feat_2d = feat.reshape(h, w, C).permute(2, 0, 1).unsqueeze(0)
+
+            # 计算池化目标尺寸，确保至少保留 1×1（防止极端情况下尺寸归零）
+            new_h = max(h // pool_size, 1)
+            new_w = max(w // pool_size, 1)
+
+            # ── 自适应平均池化：[1, C, H, W] → [1, C, new_h, new_w] ──
+            # 先转 float32 保证精度，池化后转回原 dtype 保持一致性
+            feat_pooled = F.adaptive_avg_pool2d(
+                feat_2d.float(), (new_h, new_w)
+            ).to(feat.dtype)
+
+            # ── 还原为 token 序列：[1, C, new_h, new_w] → [new_h*new_w, C] ──
+            feat_pooled = feat_pooled.squeeze(0).permute(1, 2, 0).reshape(-1, C)
+            compressed_reversed.append(feat_pooled)
+
+        # ── 将压缩结果从"最新帧优先"还原为"最旧帧优先"顺序，并沿 token 维度拼接 ──
+        compressed_list = list(reversed(compressed_reversed))  # oldest → newest
+        return torch.cat(compressed_list, dim=0)               # [total_compressed, C]
+
+
 class Qwen2_5_VLPatchMerger(nn.Module):
     def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
         super().__init__()
@@ -1679,7 +1775,21 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                 k_seq_dim=2,          
                 v_seq_dim=2            
             )
-        
+
+        # ===== 历史帧渐进空间压缩模块（Progressive Spatial Compressor） =====
+        # 参考 Efficient-VLN 论文：对历史帧按时间距离进行渐进压缩。
+        #   - frames_per_group : 每个压缩级别覆盖的帧数（论文最优值为 3）
+        #   - pool_sizes       : 各级别的空间下采样倍率，从近到远依次增大
+        #                        [2, 4, 8] → 近帧保留 1/4，次近 1/16，远帧 1/64
+        # 由于 self.visual 的输出已经映射到 LLM hidden_size，无需额外投影层。
+        self.history_compressor = ProgressiveSpatialCompressor(
+            frames_per_group=getattr(config, "history_frames_per_group", 3),
+            pool_sizes=getattr(config, "history_pool_sizes", [2, 4, 8]),
+        )
+        # 记录本次 forward 中实际前置到 inputs_embeds 的历史 token 数，
+        # 供 position_ids 动态调整使用，每次 forward 开始时重置为 0。
+        self._n_hist_prepended: int = 0
+
         if getattr(config, "add_ground_classifier", False):
             self.classifier = nn.Sequential(
                 Qwen2RMSNorm(config.hidden_size, eps=1e-6),
@@ -1931,6 +2041,17 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         images_vggt: Optional[List[torch.Tensor]] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
+        # ── 历史帧渐进压缩接口 ──────────────────────────────────────────────────
+        # history_pixel_values : 所有历史帧的 pixel_values，通过 visual 编码器处理，
+        #                        shape = [total_hist_patches, C_in]，
+        #                        由 processor 对历史帧独立预处理后提供。
+        history_pixel_values: Optional[torch.Tensor] = None,
+        # history_grid_thw    : 每帧对应的 (T, H, W) grid（patch 级别，T=1），
+        #                        shape = [n_total_history_frames, 3]。
+        history_grid_thw: Optional[torch.LongTensor] = None,
+        # history_frame_counts : 每个 batch item 拥有的历史帧数量（用于按样本分组）。
+        #                        长度 = batch_size；若不提供则默认全属于第 0 个样本。
+        history_frame_counts: Optional[List[int]] = None,
         **kwargs,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -2079,6 +2200,195 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+            # ===================================================================
+            # 历史帧渐进空间压缩处理
+            # ===================================================================
+            # 设计原则：
+            #   - 当前帧正常走 visual + VGGT 空间对齐（保留 3D 几何信息）
+            #   - 历史帧仅过 self.visual 视觉编码器，不做空间对齐（无 VGGT）
+            #   - 按时间距离分组，越早的帧压缩比越大
+            #   - 压缩后的历史 token 前置到 inputs_embeds，接受因果注意力
+            # ===================================================================
+            self._n_hist_prepended = 0  # 每次 forward 开始时重置历史 token 计数
+
+            if history_pixel_values is not None and history_grid_thw is not None:
+                merge_size = self.config.vision_config.spatial_merge_size  # 通常为 2
+
+                # ── Step 1: 视觉编码历史帧 ────────────────────────────────────
+                # 使用 no_grad 节省显存：历史帧不需要回传梯度，
+                # 行为与 VGGT 中冻结参数的做法一致。
+                with torch.no_grad():
+                    hist_embeds_all = self.visual(
+                        history_pixel_values.type(self.visual.dtype),
+                        grid_thw=history_grid_thw,
+                    )
+                    # hist_embeds_all shape:
+                    #   [sum_i(H_i * W_i / merge_size^2), hidden_size]
+                    # 其中 H_i、W_i 是第 i 帧在 patch 级别的尺寸（来自 history_grid_thw）
+
+                # ── Step 2: 计算每帧经 PatchMerger 后的 token 数与空间网格 ───
+                # history_grid_thw[i] = (T_i, H_i_patches, W_i_patches)
+                # PatchMerger 将 merge_size×merge_size 的 patch 合并为 1 个 token
+                per_frame_tokens = [
+                    (int(thw[1]) // merge_size) * (int(thw[2]) // merge_size)
+                    for thw in history_grid_thw
+                ]  # 每帧在 LLM 侧占用的 token 数
+
+                per_frame_grids = [
+                    (int(thw[1]) // merge_size, int(thw[2]) // merge_size)
+                    for thw in history_grid_thw
+                ]  # 每帧 PatchMerger 后的有效空间网格 (H_eff, W_eff)
+
+                # ── Step 3: 按帧分割连续的历史嵌入序列 ───────────────────────
+                hist_embeds_per_frame: List[torch.Tensor] = list(
+                    torch.split(hist_embeds_all, per_frame_tokens, dim=0)
+                )
+
+                # ── Step 4: 按 batch item 分组，分别做渐进空间压缩 ────────────
+                # history_frame_counts[b] = 第 b 个样本拥有的历史帧数
+                if history_frame_counts is None:
+                    # 默认：所有历史帧属于 batch 中的第一个样本
+                    history_frame_counts = [len(history_grid_thw)]
+
+                batch_size = inputs_embeds.shape[0]
+                frame_offset = 0
+                compressed_per_batch: List[torch.Tensor] = []
+
+                for b in range(batch_size):
+                    n_hist = (
+                        history_frame_counts[b]
+                        if b < len(history_frame_counts) else 0
+                    )
+                    if n_hist > 0:
+                        # 取出该样本对应的历史帧特征和网格信息
+                        batch_feats = hist_embeds_per_frame[
+                            frame_offset: frame_offset + n_hist
+                        ]
+                        batch_grids = per_frame_grids[
+                            frame_offset: frame_offset + n_hist
+                        ]
+                        frame_offset += n_hist
+
+                        # ProgressiveSpatialCompressor 渐进压缩：
+                        #   越早的帧 → 越大的 pool_size → 保留越少 token
+                        compressed = self.history_compressor(
+                            list(batch_feats), batch_grids
+                        ).to(inputs_embeds.dtype)
+                        # compressed shape: [total_compressed_tokens, hidden_size]
+                    else:
+                        # 该样本没有历史帧，用空张量占位
+                        compressed = torch.zeros(
+                            0, inputs_embeds.shape[-1],
+                            device=inputs_embeds.device,
+                            dtype=inputs_embeds.dtype,
+                        )
+                    compressed_per_batch.append(compressed)
+
+                # ── Step 5: Left-pad 使各样本历史 token 对齐（批量推理时） ──
+                max_hist_len = max(c.shape[0] for c in compressed_per_batch)
+
+                if max_hist_len > 0:
+                    hist_embeds_padded: List[torch.Tensor] = []
+                    hist_mask_list: List[torch.Tensor] = []
+
+                    for compressed in compressed_per_batch:
+                        n = compressed.shape[0]
+                        pad_len = max_hist_len - n
+
+                        if pad_len > 0:
+                            # 在左侧填充 0 嵌入（对应的 attention_mask = 0，不参与注意力）
+                            pad = torch.zeros(
+                                pad_len, compressed.shape[-1],
+                                device=compressed.device,
+                                dtype=compressed.dtype,
+                            )
+                            padded = torch.cat([pad, compressed], dim=0)
+                            # 左侧 pad 位置 mask=0，实际历史 token mask=1
+                            mask = torch.cat([
+                                torch.zeros(pad_len, device=compressed.device),
+                                torch.ones(n, device=compressed.device),
+                            ], dim=0)
+                        else:
+                            padded = compressed
+                            mask = torch.ones(n, device=compressed.device)
+
+                        hist_embeds_padded.append(padded)
+                        hist_mask_list.append(mask)
+
+                    # [batch_size, max_hist_len, hidden_size]
+                    hist_embeds_tensor = torch.stack(hist_embeds_padded, dim=0)
+                    # [batch_size, max_hist_len]
+                    hist_mask_tensor = torch.stack(hist_mask_list, dim=0)
+
+                    # ── Step 6: 将压缩历史 token 前置到 inputs_embeds ─────────
+                    # 最终序列结构：[历史压缩帧tokens | 当前帧tokens | 文本tokens]
+                    inputs_embeds = torch.cat(
+                        [hist_embeds_tensor.to(inputs_embeds.device), inputs_embeds],
+                        dim=1,
+                    )
+                    # inputs_embeds: [batch_size, max_hist_len + orig_seq_len, hidden_size]
+
+                    # ── Step 7: 同步扩展 attention_mask ───────────────────────
+                    if attention_mask is not None:
+                        # 在 attention_mask 左侧追加历史 token 的 mask
+                        attention_mask = torch.cat(
+                            [
+                                hist_mask_tensor.to(
+                                    attention_mask.device, attention_mask.dtype
+                                ),
+                                attention_mask,
+                            ],
+                            dim=1,
+                        )
+                    else:
+                        # 若原来没有 attention_mask，则对原序列全部置 1
+                        orig_seq_len = inputs_embeds.shape[1] - max_hist_len
+                        attention_mask = torch.cat([
+                            hist_mask_tensor.to(inputs_embeds.device),
+                            torch.ones(
+                                batch_size, orig_seq_len,
+                                device=inputs_embeds.device,
+                            ),
+                        ], dim=1)
+
+                    # 记录实际前置的历史 token 数，供后续 position_ids 调整使用
+                    self._n_hist_prepended = max_hist_len
+
+                    # ── Step 8: 扩展 labels（训练专用） ──────────────────────
+                    # inputs_embeds 的序列长度已增加 max_hist_len，
+                    # 但 labels 还是原序列长度。若直接计算 loss 会 shape 不匹配。
+                    # 在 labels 最前面追加 max_hist_len 个 IGNORE_INDEX(-100)，
+                    # 使历史 token 位置不贡献到语言模型损失。
+                    if labels is not None:
+                        hist_ignore = torch.full(
+                            (labels.shape[0], max_hist_len),
+                            -100,
+                            device=labels.device,
+                            dtype=labels.dtype,
+                        )
+                        labels = torch.cat([hist_ignore, labels], dim=1)
+
+                    # ── Step 9: 调整训练时预计算的 position_ids ──────────────
+                    # 训练路径下，数据集提供了 position_ids（3D tensor），
+                    # 此时 get_rope_index 不会被调用，需要在这里手动把历史帧
+                    # 的位置 [0, 1, ..., max_hist_len-1] 前置，并将原序列整体
+                    # 后移 max_hist_len，保证位置编码不重叠。
+                    if position_ids is not None and position_ids.ndim == 3:
+                        hist_pos = (
+                            torch.arange(
+                                max_hist_len,
+                                device=position_ids.device,
+                                dtype=position_ids.dtype,
+                            )
+                            .view(1, 1, max_hist_len)
+                            .expand(3, position_ids.shape[1], max_hist_len)
+                        )
+                        position_ids = position_ids + max_hist_len
+                        position_ids = torch.cat([hist_pos, position_ids], dim=2)
+            # ===================================================================
+            # 历史帧渐进压缩处理结束
+            # ===================================================================
+
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
@@ -2098,6 +2408,29 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                     attention_mask,
                 )
                 self.rope_deltas = rope_deltas
+
+                # ── 为前置的历史 token 调整 position_ids ──────────────────────
+                # get_rope_index 只感知 input_ids 中的 image/video/text token，
+                # 不知道我们在 inputs_embeds 最前面额外插入了历史帧 token，
+                # 因此需要手动：
+                #   1. 在 position_ids 最前面插入历史 token 的平坦位置 [0,…,n-1]
+                #   2. 将原有序列位置整体右移 n_hist，避免与历史 token 位置重叠
+                #   3. 同步修正 rope_deltas（解码阶段位置计算的基准偏移量）
+                if self._n_hist_prepended > 0:
+                    n_hist = self._n_hist_prepended
+                    # 历史 token 使用连续平坦的位置 ID（三个维度值相同，类似文本 token）
+                    # hist_pos shape: [3, batch_size, n_hist]
+                    hist_pos = (
+                        torch.arange(n_hist, device=position_ids.device, dtype=position_ids.dtype)
+                        .view(1, 1, n_hist)
+                        .expand(3, position_ids.shape[1], n_hist)
+                    )
+                    # 原有序列的所有位置整体 +n_hist，为历史 token 腾出位置空间
+                    position_ids = position_ids + n_hist
+                    # 拼接：历史帧平坦位置在前，原序列（当前帧+文本）位置在后
+                    position_ids = torch.cat([hist_pos, position_ids], dim=2)
+                    # 同步修正 rope_deltas：后续解码步骤的位置计算需要加上 n_hist 的偏移
+                    self.rope_deltas = self.rope_deltas + n_hist
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
@@ -2179,6 +2512,10 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         image_grid_thw=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        # ── 历史帧渐进压缩参数（仅在 prefill 阶段即 cache_position[0]==0 时有效）──
+        history_pixel_values: Optional[torch.Tensor] = None,
+        history_grid_thw: Optional[torch.LongTensor] = None,
+        history_frame_counts: Optional[List[int]] = None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -2203,8 +2540,19 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         model_inputs["position_ids"] = None
 
         if cache_position[0] != 0:
+            # 解码阶段（step > 0）：不再需要视觉输入，全部置 None
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+            # 历史帧渐进压缩输入同样只在 prefill (step=0) 时处理，
+            # step>0 时置 None 以避免重复编码，节省计算。
+            model_inputs["history_pixel_values"] = None
+            model_inputs["history_grid_thw"] = None
+            model_inputs["history_frame_counts"] = None
+        else:
+            # prefill 阶段：将历史帧参数传入 forward
+            model_inputs["history_pixel_values"] = history_pixel_values
+            model_inputs["history_grid_thw"] = history_grid_thw
+            model_inputs["history_frame_counts"] = history_frame_counts
 
         return model_inputs
 

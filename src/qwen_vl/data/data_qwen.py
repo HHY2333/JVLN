@@ -425,6 +425,9 @@ class LazySupervisedDataset(Dataset):
         if "image" in sources[0]:
             image_folder = self.list_data_dict[i]["data_path"]
             image_file = self.list_data_dict[i]["image"]
+            # 初始化历史帧容器（单帧样本时保持为空，不影响现有逻辑）
+            history_pixel_values_list: List[torch.Tensor] = []
+            history_grid_thw_list: List[torch.Tensor] = []
             if isinstance(image_file, List):
                 if len(image_file) > 1:
                     if isinstance(image_file[0], str):
@@ -443,22 +446,39 @@ class LazySupervisedDataset(Dataset):
                     # results = [self.process_image_unified_vggt(file) for file in image_file]
                     # image, grid_thw = zip(*results)
                     image, grid_thw, images_vggt = [], [], []
-                    # for i ,file in enumerate(image_file):
-                    #     if i == len(image_file) -1:
-                    #         ret = self.process_image_unified_vggt(file,True)
-                    #     else:
-                    #         ret = self.process_image_unified_vggt(file,False)
-
-                    #     image.append(ret["pixel_values"])
-                    #     images_vggt.append(ret["images_vggt"])
-                    #     grid_thw.append(ret["image_grid_thw"])
+                    # 初始化历史帧容器（默认为空；单帧样本时不填充）
+                    history_pixel_values_list: List[torch.Tensor] = []
+                    history_grid_thw_list: List[torch.Tensor] = []
 
                     for file in image_file:
-
                         ret = self.process_image_unified_vggt(file)
                         image.append(ret["pixel_values"])
                         images_vggt.append(ret["images_vggt"])
                         grid_thw.append(ret["image_grid_thw"])
+
+                    # ── 渐进压缩：将历史帧与当前帧分离 ──────────────────────
+                    # images_vggt 保留全部帧（供 VGGT 建立时序上下文）
+                    # 历史帧的 pixel_values / grid_thw 单独存储，通过
+                    # ProgressiveSpatialCompressor 压缩后前置到 inputs_embeds
+                    if len(image) > 1:
+                        history_pixel_values_list = image[:-1]   # list[Tensor]
+                        history_grid_thw_list     = grid_thw[:-1] # list[Tensor]
+                        # 只保留当前帧进入 <image> token 流程
+                        image    = [image[-1]]
+                        grid_thw = [grid_thw[-1]]
+
+                        # ── 将对话中 N 个 <image> 占位符缩减为 1 个 ──────────
+                        # preprocess_qwen_2_visual 依赖 <image> 数量与 grid_thw
+                        # 条目一一对应；现在只有 1 个当前帧进入 token，故只保留
+                        # 最后一个 <image> 后面的文本，拼上单个 <image> 前缀。
+                        conv_val = sources[0]["conversations"][0]["value"]
+                        img_token_count = conv_val.count(DEFAULT_IMAGE_TOKEN)
+                        if img_token_count > 1:
+                            # rsplit 保留最后一个 <image> 之后的文本
+                            after_last_img = conv_val.rsplit(DEFAULT_IMAGE_TOKEN, 1)[-1]
+                            sources[0]["conversations"][0]["value"] = (
+                                DEFAULT_IMAGE_TOKEN + after_last_img
+                            )
                 else:
                     image_file = image_file[0]
                     if isinstance(image_file, str):
@@ -558,6 +578,12 @@ class LazySupervisedDataset(Dataset):
             data_dict["pixel_values"] = image
             data_dict["image_grid_thw"] = grid_thw
             data_dict["images_vggt"] = images_vggt
+            # 历史帧渐进压缩字段：仅多帧样本时填充，单帧样本保持为 None
+            # history_pixel_values_list / history_grid_thw_list 由上方分离逻辑赋值
+            if history_pixel_values_list:
+                # 每个样本的历史帧数，DataCollator 按此字段拆分 batch
+                data_dict["history_pixel_values"] = history_pixel_values_list
+                data_dict["history_grid_thw"]     = history_grid_thw_list
         # video exist in the data
         elif "video" in self.list_data_dict[i]:
             data_dict["pixel_values_videos"] = video
@@ -662,6 +688,42 @@ class DataCollatorForSupervisedDataset(object):
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
+
+        # ===================================================================
+        # 历史帧渐进空间压缩：collate history_pixel_values / history_grid_thw
+        # ===================================================================
+        # history_pixel_values_list[b] 是第 b 个样本的历史帧 pixel tensor 列表
+        # 将所有样本的历史帧按顺序 cat 为一个大张量，
+        # 并用 history_frame_counts 记录每个样本对应多少帧
+        all_hist_pv: List[torch.Tensor] = []
+        all_hist_grid: List[torch.Tensor] = []
+        history_frame_counts: List[int] = []
+
+        for instance in instances:
+            hist_pv   = instance.get("history_pixel_values", [])  # list[Tensor] or []
+            hist_grid = instance.get("history_grid_thw",     [])  # list[Tensor] or []
+            n_hist = len(hist_pv)
+            history_frame_counts.append(n_hist)
+            if n_hist > 0:
+                # 每帧 pixel_values shape: [patch_len, C]，直接 extend
+                all_hist_pv.extend(hist_pv)
+                all_hist_grid.extend(hist_grid)
+
+        if any(c > 0 for c in history_frame_counts):
+            # cat 得到 [total_hist_patches, C_in]，与 models.visual 的输入格式一致
+            batch["history_pixel_values"] = torch.cat(all_hist_pv, dim=0)
+            # stack 得到 [n_total_history_frames, 3]（T, H_patches, W_patches）
+            batch["history_grid_thw"]     = torch.stack(all_hist_grid, dim=0)
+            # list[int] 长度 = batch_size，forward 据此拆分每个样本的历史帧
+            batch["history_frame_counts"] = history_frame_counts
+        else:
+            # 全为单帧样本（无历史），传 None 使 forward 跳过历史压缩逻辑
+            batch["history_pixel_values"] = None
+            batch["history_grid_thw"]     = None
+            batch["history_frame_counts"] = None
+        # ===================================================================
+        # 历史帧 collate 结束
+        # ===================================================================
                 
         # assume all data in a batch has images_vggt
         if "images_vggt" in instances[0]:

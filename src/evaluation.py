@@ -274,30 +274,49 @@ class JanusVLN_Inference:
         add_frame_index: bool=False,
         gen_kwargs: dict = {},
     ):
-        
+        # =========================================================================
+        # 分离历史帧与当前帧
+        # =========================================================================
+        # observations 是一个 PIL Image 列表，最后一帧为当前观测，其余为历史帧。
+        # 设计约定：
+        #   - 当前帧（current_obs）: 作为常规 image token 嵌入 prompt，
+        #                            同时走 VGGT 空间对齐（images_vggt）。
+        #   - 历史帧（history_obs）: 不出现在 prompt 的 image token 中，
+        #                            而是通过 history_pixel_values 送入模型，
+        #                            在 forward() 中经过渐进空间压缩后前置到
+        #                            inputs_embeds，参与因果注意力。
+        if isinstance(observations, (list, tuple)) and len(observations) > 1:
+            history_obs = observations[:-1]   # 历史帧（PIL Image list，旧 → 新）
+            current_obs = observations[-1]    # 当前帧（PIL Image）
+        elif isinstance(observations, (list, tuple)) and len(observations) == 1:
+            history_obs = []
+            current_obs = observations[0]
+        else:
+            # 单张 PIL Image，无历史
+            history_obs = []
+            current_obs = observations
+
         messages = []
         message = [
                 {"role": "system", 
                 "content": "You are a visual language navigation model, and your should go to the locations to complete the given task. Compare the observation and instruction to infer your current progress, and then select the correct direction from the candidates to go to the target location and finish the task."
                 }
             ]
-        context = f"These images are your historical observations and your current observation.\n Your task is to {task} \n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
+        # 更新 context：历史帧已通过渐进压缩作为隐式上下文编码，不在提示中显示
+        context = f"This image is your current observation. Historical frames are encoded as additional context.\n Your task is to {task} \n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
         patch_size = self.processor.image_processor.patch_size
         merge_size = self.processor.image_processor.merge_size
         for i in enumerate([task]):
-    
-            visual = observations
-            if isinstance(visual, Image.Image): 
-                message.append({"role": "user", "content": [{"type": "image", "image": visual}, {"type": "text", "text": context}]})
-            elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  
-                image_content = []
-                image_count = 0
-                for v in visual:
-                    if add_frame_index:
-                        image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})    
-                    image_content.append({"type": "image", "image": v})
-                    image_count += 1
-                message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
+            # ── 只将当前帧作为 image token 放入 prompt ──────────────────────
+            # 历史帧不在此处放入 message，而是通过 history_pixel_values 独立处理
+            if isinstance(current_obs, Image.Image):
+                message.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": current_obs},
+                        {"type": "text", "text": context},
+                    ]
+                })
             else:
                 message.append({"role": "user", "content": [{"type": "text", "text": context}]})
 
@@ -311,6 +330,7 @@ class JanusVLN_Inference:
         for message in messages:
             vision_info = extract_vision_info(message)
             cur_images_vggt = []
+            # 此时 vision_info 只包含当前帧（已不含历史帧）
             for i, ele in enumerate(vision_info):
                 if "image" in ele:
                     image = ele["image"]
@@ -330,8 +350,10 @@ class JanusVLN_Inference:
                 image = load_and_preprocess_images([image])[0]
 
                 if i == len(vision_info) - 1:
+                    # 最后一帧（当前帧）送入 VGGT 做空间对齐
                     cur_images_vggt.append(image)
 
+                # 裁剪为 patch_size * merge_size 的整数倍
                 _, height, width = image.shape
                 if (width // patch_size) % merge_size > 0:
                     width = width - (width // patch_size) % merge_size * patch_size
@@ -341,7 +363,45 @@ class JanusVLN_Inference:
                 image_inputs.append(image)
     
             images_vggt.append(torch.stack(cur_images_vggt))
-        
+
+        # =========================================================================
+        # 单独预处理历史帧，得到 history_pixel_values 和 history_grid_thw
+        # =========================================================================
+        # 历史帧走与当前帧完全相同的预处理管线（load → crop），
+        # 然后通过 image_processor 独立计算 pixel_values 和 image_grid_thw，
+        # 不参与 prompt 的 image token 计数。
+        history_pixel_values = None
+        history_grid_thw = None
+        history_frame_counts = None
+
+        if len(history_obs) > 0:
+            hist_image_inputs = []
+            for hist_pil in history_obs:
+                # 与当前帧相同的加载 + 预处理流程
+                hist_img = load_and_preprocess_images([hist_pil])[0]
+
+                # 裁剪为 patch_size * merge_size 的整数倍（与当前帧一致）
+                _, h_px, w_px = hist_img.shape
+                if (w_px // patch_size) % merge_size > 0:
+                    w_px = w_px - (w_px // patch_size) % merge_size * patch_size
+                if (h_px // patch_size) % merge_size > 0:
+                    h_px = h_px - (h_px // patch_size) % merge_size * patch_size
+                hist_img = hist_img[:, :h_px, :w_px]
+                hist_image_inputs.append(hist_img)
+
+            # 调用 image_processor 独立处理历史帧，
+            # 将预处理后的张量（不再 rescale）转为 pixel_values 和 image_grid_thw
+            device = self.model.device
+            hist_proc_out = self.processor.image_processor(
+                images=hist_image_inputs,
+                return_tensors="pt",
+                do_rescale=False,   # 已由 load_and_preprocess_images 归一化
+            )
+            history_pixel_values = hist_proc_out["pixel_values"].to(device)
+            history_grid_thw    = hist_proc_out["image_grid_thw"].to(device)
+            # 单 batch 推理：所有历史帧都属于第 0 个样本
+            history_frame_counts = [len(hist_image_inputs)]
+
         inputs = self.processor(
             text=text,
             images=image_inputs,
@@ -353,6 +413,11 @@ class JanusVLN_Inference:
         device = self.model.device
 
         inputs["images_vggt"] = [feat.to(device) for feat in images_vggt]
+        # 将历史帧渐进压缩所需的输入追加到 inputs，
+        # generate() 会在 prefill 阶段将其传给 forward()，step>0 时自动置 None。
+        inputs["history_pixel_values"] = history_pixel_values
+        inputs["history_grid_thw"]     = history_grid_thw
+        inputs["history_frame_counts"] = history_frame_counts
         inputs = inputs.to(device)
     
         if "max_new_tokens" not in gen_kwargs:
