@@ -24,6 +24,7 @@ from typing import Dict
 import shutil
 import sys
 from pathlib import Path
+from transformers import TrainerCallback, TrainerState, TrainerControl
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
@@ -42,13 +43,65 @@ from qwen_vl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer, AutoConfig, set_seed, enable_full_determinism
+from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer, AutoConfig, set_seed, enable_full_determinism, TrainerCallback, TrainerState, TrainerControl
 
 local_rank = None
+
+class StopAtStepCallback(TrainerCallback):
+    def __init__(self, stop_step: int):
+        self.stop_step = stop_step
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if state.global_step >= self.stop_step:
+            control.should_training_stop = True
+
 
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+class TrainingProgressCallback(TrainerCallback):
+    """每隔 logging_steps 打印一行包含总步数和总样本量的进度信息。"""
+
+    def __init__(self):
+        self._global_batch_size = None
+        self._dataset_size = None
+        self._total_steps = None
+
+    def on_train_begin(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        # 从 Trainer args 和 state 计算关键量
+        self._global_batch_size = (
+            args.per_device_train_batch_size
+            * args.gradient_accumulation_steps
+            * args.world_size
+        )
+        train_dataloader = kwargs.get("train_dataloader", None)
+        # state.max_steps 由 Trainer 在 train_begin 前计算好
+        self._total_steps = state.max_steps
+        # 优先从 dataloader.dataset 获取真实样本数
+        self._dataset_size = None
+        if train_dataloader is not None and hasattr(train_dataloader, "dataset"):
+            try:
+                self._dataset_size = len(train_dataloader.dataset)
+            except Exception:
+                self._dataset_size = None
+        # 其次使用 Trainer state 中的统计
+        if self._dataset_size is None:
+            self._dataset_size = getattr(state, "num_train_samples", None)
+        if self._dataset_size is None:
+            # 退回：用总步 × 全局 batch size 估算
+            self._dataset_size = self._total_steps * self._global_batch_size
+        if state.is_local_process_zero:
+            print(
+                f"\n[TrainInfo] 数据集样本数: {self._dataset_size:,} | "
+                f"全局 batch size: {self._global_batch_size} | "
+                f"总步数: {self._total_steps:,}\n"
+            )
+
+    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if state.is_local_process_zero:
+            print("", flush=True)
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -100,11 +153,24 @@ def set_model(model_args, model):
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
+    if "--stop_at_step" in sys.argv:
+        idx = sys.argv.index("--stop_at_step")
+        stop_at_step = int(sys.argv[idx + 1])
+        # 从 sys.argv 移除，避免 HfArgumentParser 报错
+        sys.argv.pop(idx)
+        sys.argv.pop(idx)
+    else:
+        stop_at_step = None
+
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     set_seed(training_args.seed)
+    
+    # 屏蔽 transformers 初始化时不匹配权重的乱七八糟警告
+    transformers.logging.set_verbosity_error()
+
     # enable_full_determinism(training_args.seed)
 
     local_rank = training_args.local_rank
@@ -114,14 +180,21 @@ def train(attn_implementation="flash_attention_2"):
         from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationForJanusVLN
         config = AutoConfig.from_pretrained(model_args.model_name_or_path)
         setattr(config, "lam", model_args.lam)
+        # 临时压制 transformers modeling_utils 的 WARNING 级别日志，
+        # 避免 ignore_mismatched_sizes=True 时打印大量 vggt 参数 key 列表
+        _mu_logger = logging.getLogger("transformers.modeling_utils")
+        _mu_prev_level = _mu_logger.level
+        _mu_logger.setLevel(logging.ERROR)
         model = Qwen2_5_VLForConditionalGenerationForJanusVLN.from_pretrained(
             pretrained_model_name_or_path=model_args.model_name_or_path,
             config=config,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            vggt_model_path=model_args.vggt_model_path
+            vggt_model_path=model_args.vggt_model_path,
+            ignore_mismatched_sizes=True
         )
+        _mu_logger.setLevel(_mu_prev_level)  # 恢复日志级别
 
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -166,8 +239,16 @@ def train(attn_implementation="flash_attention_2"):
         model.model.print_trainable_parameters()
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    callbacks = [TrainingProgressCallback()]
+    if stop_at_step is not None:
+        callbacks.append(StopAtStepCallback(stop_at_step))
+
     trainer = Trainer(
-        model=model, processing_class=tokenizer, args=training_args, **data_module
+        model=model,
+        processing_class=tokenizer,
+        args=training_args,
+        callbacks=callbacks,
+        **data_module,
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):

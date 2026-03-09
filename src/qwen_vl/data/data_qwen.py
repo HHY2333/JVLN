@@ -736,89 +736,54 @@ class DataCollatorForSupervisedDataset(object):
 
 @dataclass
 class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset):
-    """Collate examples into packed sequence with multi-modal support."""
+    """Collate examples into a packed (flattened) sequence with block-sparse attention.
+
+    序列打包策略：
+    - 将 batch 内所有样本的 token 序列沿 seq 维度拼接为单一长序列（batch_size=1）。
+    - attention_mask 传入 cu_seqlens（累积序列长度），由 flash_attn_varlen_func
+      实现块稀疏因果注意力，保证各样本间不互相 attend。
+    - position_ids 同样拼接，保持各样本内部的 RoPE 索引独立。
+    - pixel_values / images_vggt / history_* 等视觉字段与父类保持一致，
+      直接复用父类的处理逻辑。
+    """
 
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels, position_ids = tuple(
-            [instance[key] for instance in instances]
-            for key in ("input_ids", "labels", "position_ids")
-        )
+        # ── 1. 调用父类，处理视觉字段（images_vggt / pixel_values 等）──
+        batch = super().__call__(instances)
 
+        # 打包模式下 history_pixel_values / history_grid_thw / history_frame_counts
+        # 由父类 DataCollatorForSupervisedDataset.__call__ 正常填充，此处不再强制置 None。
+        # forward() 中已增加 packed 模式分支，会按子序列逐个插入历史 token 并重建
+        # cu_seqlens，与 data_flatten=False 时的行为语义完全一致。
+
+        # ── 2. 用打包方案覆盖 input_ids / labels / attention_mask / position_ids ──
+        input_ids   = [instance["input_ids"]   for instance in instances]
+        labels      = [instance["labels"]      for instance in instances]
+        position_ids = [instance["position_ids"] for instance in instances]
+
+        # cu_seqlens: [0, len_0, len_0+len_1, ...] ，用于 flash_attn_varlen_func
         seq_lens = torch.tensor(
-            [0] + [len(seq) for seq in input_ids], dtype=torch.int32
+            [0] + [ids.numel() for ids in input_ids], dtype=torch.int32
         )
         cumsum_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
-        input_ids = torch.cat(input_ids, dim=0)
-        labels = torch.cat(labels, dim=0)
-        position_ids = torch.cat(position_ids, dim=2)
 
-        batch = dict(
-            input_ids=input_ids.unsqueeze(0),
-            labels=labels.unsqueeze(0),
-            attention_mask=cumsum_seq_lens,
-            position_ids=position_ids,
-        )
-        images = list(
-            itertools.chain(
-                *(
-                    instance["pixel_values"]
-                    for instance in instances
-                    if "pixel_values" in instance
-                )
-            )
-        )
-        videos = list(
-            itertools.chain(
-                *(
-                    instance["pixel_values_videos"]
-                    for instance in instances
-                    if "pixel_values_videos" in instance
-                )
-            )
-        )
-        if len(images) != 0:
-            concat_images = torch.cat([image for image in images], dim=0)
-            grid_thw = list(
-                itertools.chain(
-                    *(
-                        instance["image_grid_thw"]
-                        for instance in instances
-                        if "image_grid_thw" in instance
-                    )
-                )
-            )
-            grid_thw = torch.stack(grid_thw, dim=0)
-        else:
-            concat_images = None
-            grid_thw = None
+        # 拼接为单条长序列，batch 维度保持为 1
+        packed_input_ids   = torch.cat(input_ids,    dim=0).unsqueeze(0)   # [1, total_len]
+        packed_labels      = torch.cat(labels,       dim=0).unsqueeze(0)   # [1, total_len]
+        packed_position_ids = torch.cat(position_ids, dim=2)               # [3, 1, total_len]
 
-        if len(videos) != 0:
-            concat_videos = torch.cat([video for video in videos], dim=0)
-            video_grid_thw = list(
-                itertools.chain(
-                    *(
-                        instance["video_grid_thw"]
-                        for instance in instances
-                        if "video_grid_thw" in instance
-                    )
-                )
-            )
-            video_grid_thw = torch.stack(video_grid_thw, dim=0)
-        else:
-            concat_videos = None
-            video_grid_thw = None
+        # 截断到 model_max_length（防止极端情况溢出）
+        max_len = self.tokenizer.model_max_length
+        packed_input_ids    = packed_input_ids[:, :max_len]
+        packed_labels       = packed_labels[:, :max_len]
+        packed_position_ids = packed_position_ids[:, :, :max_len]
 
-        batch["pixel_values"] = concat_images
-        batch["image_grid_thw"] = grid_thw
-        batch["pixel_values_videos"] = concat_videos
-        batch["video_grid_thw"] = video_grid_thw
-
-                
-        # assume all data in a batch has images_vggt
-        if "images_vggt" in instances[0]:
-            raise NotImplementedError("FlattenedDataCollatorForSupervisedDataset does not support images_vggt")
+        batch["input_ids"]    = packed_input_ids
+        batch["labels"]       = packed_labels
+        batch["attention_mask"] = cumsum_seq_lens   # 传给 _flash_attention_forward
+        batch["position_ids"] = packed_position_ids
 
         return batch
 

@@ -279,11 +279,17 @@ class Qwen2_5_VLPatchMerger(nn.Module):
 def apply_rotary_pos_emb_flashatt(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.chunk(2, dim=-1)[0].contiguous()
-    sin = sin.chunk(2, dim=-1)[0].contiguous()
-    q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
-    k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
-    return q_embed, k_embed
+    # 修复：避免使用与 PyTorch 2.5 不兼容的 flash_attn.layers.rotary.apply_rotary_emb
+    # 改为使用本文件定义的纯 PyTorch 实现 apply_rotary_pos_emb_vision
+    return apply_rotary_pos_emb_vision(q, k, cos, sin)
+    
+    # 原始代码如下（已注释）:
+    # cos = cos.chunk(2, dim=-1)[0].contiguous()
+    # sin = sin.chunk(2, dim=-1)[0].contiguous()
+    # q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
+    # k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
+    # return q_embed, k_embed
+
 
 
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
@@ -1748,6 +1754,8 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
     _tied_weights_keys = ["lm_head.weight"]
     config_class = Qwen2_5_VLConfig
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
+    _keys_to_ignore_on_save = [r"vggt\..*"]
+    _keys_to_ignore_on_load_unexpected = [r"vggt\..*"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1812,7 +1820,7 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         model.mode = mode
         if vggt_model_path:
-            print(f"Loading VGGT from {vggt_model_path}")
+            # print(f"Loading VGGT from {vggt_model_path}")
             vggt = VGGT.from_pretrained(vggt_model_path)
             vggt.camera_head = None
             vggt.track_head = None
@@ -2250,141 +2258,223 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                     # 默认：所有历史帧属于 batch 中的第一个样本
                     history_frame_counts = [len(history_grid_thw)]
 
-                batch_size = inputs_embeds.shape[0]
-                frame_offset = 0
-                compressed_per_batch: List[torch.Tensor] = []
+                # ── 检测是否为打包模式（data_flatten=True） ────────────────────
+                # 打包模式下 attention_mask 是 1D int32 的 cu_seqlens，形如
+                # [0, len_s0, len_s0+len_s1, ...]，而非普通的 2D bool mask。
+                # 此时 inputs_embeds 的 batch_size=1，所有子序列拼接在一起。
+                # 必须按子序列逐个插入历史 token，并重建 cu_seqlens，
+                # 而不是对整个 batch 做 left-pad——否则子序列边界偏移错误。
+                packed_mode = (
+                    attention_mask is not None
+                    and attention_mask.dim() == 1
+                    and attention_mask.dtype == torch.int32
+                )
 
-                for b in range(batch_size):
-                    n_hist = (
-                        history_frame_counts[b]
-                        if b < len(history_frame_counts) else 0
-                    )
-                    if n_hist > 0:
-                        # 取出该样本对应的历史帧特征和网格信息
-                        batch_feats = hist_embeds_per_frame[
-                            frame_offset: frame_offset + n_hist
-                        ]
-                        batch_grids = per_frame_grids[
-                            frame_offset: frame_offset + n_hist
-                        ]
-                        frame_offset += n_hist
+                if packed_mode:
+                    # =============================================================
+                    # 打包模式（data_flatten=True）：逐子序列插入历史 token
+                    # =============================================================
+                    cu = attention_mask.long()   # [n_subseqs+1]
+                    n_subseqs = len(cu) - 1
+                    n_hist_entries = len(history_frame_counts)
+                    frame_offset = 0
+                    compressed_per_subseq: List[torch.Tensor] = []
 
-                        # ProgressiveSpatialCompressor 渐进压缩：
-                        #   越早的帧 → 越大的 pool_size → 保留越少 token
-                        compressed = self.history_compressor(
-                            list(batch_feats), batch_grids
-                        ).to(inputs_embeds.dtype)
-                        # compressed shape: [total_compressed_tokens, hidden_size]
-                    else:
-                        # 该样本没有历史帧，用空张量占位
-                        compressed = torch.zeros(
-                            0, inputs_embeds.shape[-1],
-                            device=inputs_embeds.device,
-                            dtype=inputs_embeds.dtype,
-                        )
-                    compressed_per_batch.append(compressed)
-
-                # ── Step 5: Left-pad 使各样本历史 token 对齐（批量推理时） ──
-                max_hist_len = max(c.shape[0] for c in compressed_per_batch)
-
-                if max_hist_len > 0:
-                    hist_embeds_padded: List[torch.Tensor] = []
-                    hist_mask_list: List[torch.Tensor] = []
-
-                    for compressed in compressed_per_batch:
-                        n = compressed.shape[0]
-                        pad_len = max_hist_len - n
-
-                        if pad_len > 0:
-                            # 在左侧填充 0 嵌入（对应的 attention_mask = 0，不参与注意力）
-                            pad = torch.zeros(
-                                pad_len, compressed.shape[-1],
-                                device=compressed.device,
-                                dtype=compressed.dtype,
-                            )
-                            padded = torch.cat([pad, compressed], dim=0)
-                            # 左侧 pad 位置 mask=0，实际历史 token mask=1
-                            mask = torch.cat([
-                                torch.zeros(pad_len, device=compressed.device),
-                                torch.ones(n, device=compressed.device),
-                            ], dim=0)
+                    for s in range(n_subseqs):
+                        n_hist = history_frame_counts[s] if s < n_hist_entries else 0
+                        if n_hist > 0:
+                            batch_feats = hist_embeds_per_frame[
+                                frame_offset: frame_offset + n_hist
+                            ]
+                            batch_grids = per_frame_grids[
+                                frame_offset: frame_offset + n_hist
+                            ]
+                            frame_offset += n_hist
+                            compressed = self.history_compressor(
+                                list(batch_feats), batch_grids
+                            ).to(inputs_embeds.dtype)
                         else:
-                            padded = compressed
-                            mask = torch.ones(n, device=compressed.device)
+                            compressed = torch.zeros(
+                                0, inputs_embeds.shape[-1],
+                                device=inputs_embeds.device,
+                                dtype=inputs_embeds.dtype,
+                            )
+                        compressed_per_subseq.append(compressed)
 
-                        hist_embeds_padded.append(padded)
-                        hist_mask_list.append(mask)
+                    # 将历史 token 插入各子序列头部，重新拼接为打包序列
+                    new_chunks: List[torch.Tensor] = []
+                    new_seq_lens: List[int] = []
+                    for s in range(n_subseqs):
+                        orig_chunk = inputs_embeds[0, cu[s]:cu[s + 1]]   # [len_s, hidden]
+                        comp = compressed_per_subseq[s]                   # [n_comp_s, hidden]
+                        merged = torch.cat([comp, orig_chunk], dim=0)     # [n_comp_s+len_s, hidden]
+                        new_chunks.append(merged)
+                        new_seq_lens.append(merged.shape[0])
+                    inputs_embeds = torch.cat(new_chunks, dim=0).unsqueeze(0)  # [1, total_new, hidden]
 
-                    # [batch_size, max_hist_len, hidden_size]
-                    hist_embeds_tensor = torch.stack(hist_embeds_padded, dim=0)
-                    # [batch_size, max_hist_len]
-                    hist_mask_tensor = torch.stack(hist_mask_list, dim=0)
+                    # 重建 cu_seqlens（dtype 须保持 int32 以兼容 flash_attn_varlen_func）
+                    new_cu = torch.zeros(n_subseqs + 1, dtype=attention_mask.dtype,
+                                         device=attention_mask.device)
+                    for s in range(n_subseqs):
+                        new_cu[s + 1] = new_cu[s] + new_seq_lens[s]
+                    attention_mask = new_cu
 
-                    # ── Step 6: 将压缩历史 token 前置到 inputs_embeds ─────────
-                    # 最终序列结构：[历史压缩帧tokens | 当前帧tokens | 文本tokens]
-                    inputs_embeds = torch.cat(
-                        [hist_embeds_tensor.to(inputs_embeds.device), inputs_embeds],
-                        dim=1,
-                    )
-                    # inputs_embeds: [batch_size, max_hist_len + orig_seq_len, hidden_size]
+                    # 更新 labels：在各子序列前插入 -100（历史 token 不贡献 loss）
+                    if labels is not None:
+                        label_parts: List[torch.Tensor] = []
+                        for s in range(n_subseqs):
+                            n_comp = compressed_per_subseq[s].shape[0]
+                            if n_comp > 0:
+                                label_parts.append(
+                                    torch.full(
+                                        (n_comp,), -100,
+                                        device=labels.device, dtype=labels.dtype,
+                                    )
+                                )
+                            label_parts.append(labels[0, cu[s]:cu[s + 1]])
+                        labels = torch.cat(label_parts, dim=0).unsqueeze(0)  # [1, total_new]
 
-                    # ── Step 7: 同步扩展 attention_mask ───────────────────────
-                    if attention_mask is not None:
-                        # 在 attention_mask 左侧追加历史 token 的 mask
-                        attention_mask = torch.cat(
-                            [
-                                hist_mask_tensor.to(
-                                    attention_mask.device, attention_mask.dtype
-                                ),
-                                attention_mask,
-                            ],
+                    # 更新 position_ids：历史 token 用 [0..n_comp-1]，原序列后移 n_comp
+                    # position_ids shape: [3, 1, total_packed_len]
+                    if position_ids is not None and position_ids.ndim == 3:
+                        pos_parts: List[torch.Tensor] = []
+                        for s in range(n_subseqs):
+                            n_comp = compressed_per_subseq[s].shape[0]
+                            orig_pos_s = position_ids[:, 0, cu[s]:cu[s + 1]]  # [3, len_s]
+                            if n_comp > 0:
+                                hist_pos_s = (
+                                    torch.arange(
+                                        n_comp,
+                                        device=position_ids.device,
+                                        dtype=position_ids.dtype,
+                                    )
+                                    .unsqueeze(0)
+                                    .expand(3, n_comp)          # [3, n_comp]
+                                )
+                                orig_pos_s = orig_pos_s + n_comp  # 原序列位置向后偏移
+                                pos_parts.append(torch.cat([hist_pos_s, orig_pos_s], dim=1))
+                            else:
+                                pos_parts.append(orig_pos_s)
+                        position_ids = torch.cat(pos_parts, dim=1).unsqueeze(1)  # [3, 1, total_new]
+
+                    self._n_hist_prepended = 0  # 打包模式不使用此字段
+
+                else:
+                    # =============================================================
+                    # 非打包模式（data_flatten=False 或推理）：原有 left-pad 逻辑
+                    # =============================================================
+                    batch_size = inputs_embeds.shape[0]
+                    frame_offset = 0
+                    compressed_per_batch: List[torch.Tensor] = []
+
+                    for b in range(batch_size):
+                        n_hist = (
+                            history_frame_counts[b]
+                            if b < len(history_frame_counts) else 0
+                        )
+                        if n_hist > 0:
+                            batch_feats = hist_embeds_per_frame[
+                                frame_offset: frame_offset + n_hist
+                            ]
+                            batch_grids = per_frame_grids[
+                                frame_offset: frame_offset + n_hist
+                            ]
+                            frame_offset += n_hist
+                            compressed = self.history_compressor(
+                                list(batch_feats), batch_grids
+                            ).to(inputs_embeds.dtype)
+                        else:
+                            compressed = torch.zeros(
+                                0, inputs_embeds.shape[-1],
+                                device=inputs_embeds.device,
+                                dtype=inputs_embeds.dtype,
+                            )
+                        compressed_per_batch.append(compressed)
+
+                    # ── Step 5: Left-pad 使各样本历史 token 对齐（批量推理时） ──
+                    max_hist_len = max(c.shape[0] for c in compressed_per_batch)
+
+                    if max_hist_len > 0:
+                        hist_embeds_padded: List[torch.Tensor] = []
+                        hist_mask_list: List[torch.Tensor] = []
+
+                        for compressed in compressed_per_batch:
+                            n = compressed.shape[0]
+                            pad_len = max_hist_len - n
+
+                            if pad_len > 0:
+                                pad = torch.zeros(
+                                    pad_len, compressed.shape[-1],
+                                    device=compressed.device,
+                                    dtype=compressed.dtype,
+                                )
+                                padded = torch.cat([pad, compressed], dim=0)
+                                mask = torch.cat([
+                                    torch.zeros(pad_len, device=compressed.device),
+                                    torch.ones(n, device=compressed.device),
+                                ], dim=0)
+                            else:
+                                padded = compressed
+                                mask = torch.ones(n, device=compressed.device)
+
+                            hist_embeds_padded.append(padded)
+                            hist_mask_list.append(mask)
+
+                        hist_embeds_tensor = torch.stack(hist_embeds_padded, dim=0)  # [B, max_hist, hidden]
+                        hist_mask_tensor   = torch.stack(hist_mask_list,    dim=0)   # [B, max_hist]
+
+                        # ── Step 6: 将压缩历史 token 前置到 inputs_embeds ─────
+                        inputs_embeds = torch.cat(
+                            [hist_embeds_tensor.to(inputs_embeds.device), inputs_embeds],
                             dim=1,
                         )
-                    else:
-                        # 若原来没有 attention_mask，则对原序列全部置 1
-                        orig_seq_len = inputs_embeds.shape[1] - max_hist_len
-                        attention_mask = torch.cat([
-                            hist_mask_tensor.to(inputs_embeds.device),
-                            torch.ones(
-                                batch_size, orig_seq_len,
-                                device=inputs_embeds.device,
-                            ),
-                        ], dim=1)
 
-                    # 记录实际前置的历史 token 数，供后续 position_ids 调整使用
-                    self._n_hist_prepended = max_hist_len
-
-                    # ── Step 8: 扩展 labels（训练专用） ──────────────────────
-                    # inputs_embeds 的序列长度已增加 max_hist_len，
-                    # 但 labels 还是原序列长度。若直接计算 loss 会 shape 不匹配。
-                    # 在 labels 最前面追加 max_hist_len 个 IGNORE_INDEX(-100)，
-                    # 使历史 token 位置不贡献到语言模型损失。
-                    if labels is not None:
-                        hist_ignore = torch.full(
-                            (labels.shape[0], max_hist_len),
-                            -100,
-                            device=labels.device,
-                            dtype=labels.dtype,
-                        )
-                        labels = torch.cat([hist_ignore, labels], dim=1)
-
-                    # ── Step 9: 调整训练时预计算的 position_ids ──────────────
-                    # 训练路径下，数据集提供了 position_ids（3D tensor），
-                    # 此时 get_rope_index 不会被调用，需要在这里手动把历史帧
-                    # 的位置 [0, 1, ..., max_hist_len-1] 前置，并将原序列整体
-                    # 后移 max_hist_len，保证位置编码不重叠。
-                    if position_ids is not None and position_ids.ndim == 3:
-                        hist_pos = (
-                            torch.arange(
-                                max_hist_len,
-                                device=position_ids.device,
-                                dtype=position_ids.dtype,
+                        # ── Step 7: 同步扩展 attention_mask ─────────────────
+                        if attention_mask is not None:
+                            attention_mask = torch.cat(
+                                [
+                                    hist_mask_tensor.to(
+                                        attention_mask.device, attention_mask.dtype
+                                    ),
+                                    attention_mask,
+                                ],
+                                dim=1,
                             )
-                            .view(1, 1, max_hist_len)
-                            .expand(3, position_ids.shape[1], max_hist_len)
-                        )
-                        position_ids = position_ids + max_hist_len
-                        position_ids = torch.cat([hist_pos, position_ids], dim=2)
+                        else:
+                            orig_seq_len = inputs_embeds.shape[1] - max_hist_len
+                            attention_mask = torch.cat([
+                                hist_mask_tensor.to(inputs_embeds.device),
+                                torch.ones(
+                                    batch_size, orig_seq_len,
+                                    device=inputs_embeds.device,
+                                ),
+                            ], dim=1)
+
+                        self._n_hist_prepended = max_hist_len
+
+                        # ── Step 8: 扩展 labels（训练专用） ─────────────────
+                        if labels is not None:
+                            hist_ignore = torch.full(
+                                (labels.shape[0], max_hist_len),
+                                -100,
+                                device=labels.device,
+                                dtype=labels.dtype,
+                            )
+                            labels = torch.cat([hist_ignore, labels], dim=1)
+
+                        # ── Step 9: 调整训练时预计算的 position_ids ──────────
+                        if position_ids is not None and position_ids.ndim == 3:
+                            hist_pos = (
+                                torch.arange(
+                                    max_hist_len,
+                                    device=position_ids.device,
+                                    dtype=position_ids.dtype,
+                                )
+                                .view(1, 1, max_hist_len)
+                                .expand(3, position_ids.shape[1], max_hist_len)
+                            )
+                            position_ids = position_ids + max_hist_len
+                            position_ids = torch.cat([hist_pos, position_ids], dim=2)
             # ===================================================================
             # 历史帧渐进压缩处理结束
             # ===================================================================
@@ -2400,12 +2490,23 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                 or self.rope_deltas is None
                 or (past_key_values is None or past_key_values.get_seq_length() == 0)
             ):
+                # get_rope_index 仅处理 input_ids 中的 token，不感知前置的历史帧 token。
+                # 当历史帧被前置时，attention_mask 已扩展了 _n_hist_prepended 列，
+                # 但 input_ids 长度不变，需截取尾部对应 input_ids 长度的部分传入。
+                attn_mask_for_rope = attention_mask
+                if (
+                    input_ids is not None
+                    and attention_mask is not None
+                    and attention_mask.shape[1] > input_ids.shape[1]
+                ):
+                    attn_mask_for_rope = attention_mask[:, -input_ids.shape[1]:]
+
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids,
                     image_grid_thw,
                     video_grid_thw,
                     second_per_grid_ts,
-                    attention_mask,
+                    attn_mask_for_rope,
                 )
                 self.rope_deltas = rope_deltas
 

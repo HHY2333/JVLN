@@ -147,6 +147,14 @@ def replace_qwen2_vl_attention_class():
         _update_causal_mask
     )
 
+    # ── 同样 patch 项目自定义的 modeling_qwen2_5_vl 模块 ──────────────────
+    # 该模块从 transformers.modeling_flash_attention_utils 直接 import 了
+    # _flash_attention_forward（模块级绑定），patch 标准库不影响自定义模块。
+    # 须单独替换模块级名称，使 Qwen2_5_VLFlashAttention2 能使用 varlen 版本。
+    import qwen_vl.model.modeling_qwen2_5_vl as custom_modeling
+    custom_modeling._flash_attention_forward = _flash_attention_forward
+    custom_modeling.Qwen2_5_VLModel._update_causal_mask = _update_causal_mask
+
 
 def print_trainable_parameters_visual(self) -> None:
     """

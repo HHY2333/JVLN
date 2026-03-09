@@ -9,7 +9,7 @@ from tqdm import tqdm
 import random
 import argparse 
 
-max_history_images = 8
+max_history_images = 16
 
 def process_episode_scalevln(ep, img_root, act_map):
     episode_results = []
@@ -25,12 +25,13 @@ def process_episode_scalevln(ep, img_root, act_map):
         print(f"Warning: Directory not found for scalevln episode {episode_id}: {img_dir}")
         return [] 
 
+    STRIDE = 4  # 采样间隔：每隔 STRIDE 步取一帧，与评估保持一致
     num_images = len(img_files)
     for i in range(num_images):
-        if i <= max_history_images:
-            idxs = list(range(i + 1))
-        else:
-            idxs = np.linspace(0, i, 9, dtype=int).tolist()
+        # 从当前帧向前以 STRIDE 为步长回溯，最多取 max_history_images+1 帧
+        # range 从 i 向 0 方向步进 -STRIDE，最多取 max_history_images+1 个索引
+        back_idxs = list(range(i, max(i - max_history_images * STRIDE, -1), -STRIDE))
+        idxs = list(reversed(back_idxs))  # 恢复时间正序（旧→新，最后一个为当前帧 i）
         sampled_imgs = [img_files[j] for j in idxs]
 
         original_len = len(sampled_imgs)
@@ -43,15 +44,15 @@ def process_episode_scalevln(ep, img_root, act_map):
         if not sampled_imgs:
             continue 
         
-        his_img_tags = "<image>" * (len(sampled_imgs) - 1)
-        
         if i == num_images - 1:
             action = 'STOP'
         else:
             action = act_map[ep['actions'][i + 1]]
         
+        # Prompt 与评估对齐：单 <image> 占位当前帧，历史帧通过 images 列表传入
+        # data_qwen.py 会将历史帧分离走 ProgressiveSpatialCompressor
         conversations = [
-            {"from": "human", "value": f"You are a visual language navigation model, and your should go to the locations to complete the given task. Compare the observation and instruction to infer your current progress, and then select the correct direction from the candidates to go to the target location and finish the task.\n This is your historical observation:{his_img_tags}\n This is your current observation:<image>\n Your task is to {instruction}\n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."},
+            {"from": "human", "value": f"<image> Your task is to {instruction}\n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."},
             {"from": "gpt", "value": action}
         ]
         
@@ -82,23 +83,26 @@ def process_episode_vlnce(ep, img_root):
         print(f"Warning: Directory not found for VLN-CE episode {episode_id}: {img_dir}")
         return []
 
+    STRIDE = 4  # 采样间隔：与 process_episode_scalevln 及评估保持一致
     for i in range(len(img_files)):
 
-        if i <= max_history_images:
-            idxs = list(range(i + 1))
-        else:
-            idxs = np.linspace(0, i, 9, dtype=int).tolist()
+        back_idxs = list(range(i, max(i - max_history_images * STRIDE, -1), -STRIDE))
+        idxs = list(reversed(back_idxs))
         sampled_imgs = [img_files[j] for j in idxs]
 
-        his_img_tags = "<image>" * (len(sampled_imgs) - 1)
-        name_parts = os.path.basename(img_files[i]).replace('.png', '').split('_')
-        if len(name_parts) > 3:
-            action = f"{name_parts[-2].upper()}_{name_parts[-1].upper()}"
+        # VLN-CE 最后一帧显式设为 STOP（原代码依赖文件名提取，最后一帧可能标错）
+        if i == len(img_files) - 1:
+            action = 'STOP'
         else:
-            action = name_parts[-1].upper()
-            
+            name_parts = os.path.basename(img_files[i]).replace('.png', '').split('_')
+            if len(name_parts) > 3:
+                action = f"{name_parts[-2].upper()}_{name_parts[-1].upper()}"
+            else:
+                action = name_parts[-1].upper()
+
+        # Prompt 与评估对齐：单 <image> 占位当前帧，历史帧通过 images 列表传入
         conversations = [
-            {"from": "human", "value": f"You are a visual language navigation model, and your should go to the locations to complete the given task. Compare the observation and instruction to infer your current progress, and then select the correct direction from the candidates to go to the target location and finish the task.\n This is your historical observation:{his_img_tags}\n This is your current observation:<image>\n Your task is to {instruction}\n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."},
+            {"from": "human", "value": f"<image> Your task is to {instruction}\n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."},
             {"from": "gpt", "value": action}
         ]
         
@@ -140,12 +144,12 @@ def main():
     act_map_dagger_rxr = ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"]
 
     # --- R2R Dataset ---
-    img_root_r2r = "data/trajectory_data/R2R/train"
-    json_path_r2r = "data/datasets/r2r/train/train.json.gz"
+    img_root_r2r = "/data/datasets/data/trajectory_data/R2R/train"
+    json_path_r2r = "/data/datasets/data/datasets/r2r/train/train.json.gz"
     
     # --- RxR Dataset ---
-    img_root_rxr = "data/trajectory_data/RxR/train"
-    json_path_rxr = "data/datasets/rxr/train/train_guide.json.gz"
+    img_root_rxr = "/data/datasets/data/trajectory_data/RxR/train"
+    json_path_rxr = "/data/datasets/data/datasets/rxr/train/train_guide.json.gz"
 
     print("Loading JSON data...")
 
@@ -167,7 +171,10 @@ def main():
         data_rxr = json.load(f)
     print("JSON data loaded.")
         
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    # 磁盘 I/O 密集型任务，限制并发数避免 glob 引发大量 I/O 争用导致卡死
+    cpu_count = os.cpu_count() or 8
+    max_workers = min(cpu_count, 32)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         if args.use_extra_data:
             print("\nProcessing ScaleVLN dataset...")
             p_process_scalevln = partial(process_episode_scalevln, img_root=img_root_scalevln, act_map=act_map_scalevln)
@@ -194,7 +201,7 @@ def main():
         # --- Process R2R ---
         print("\nProcessing R2R dataset...")
         p_process_r2r = partial(process_episode_vlnce, img_root=img_root_r2r)
-        results_iterator = tqdm(executor.map(p_process_r2r, data_r2r['episodes']), total=len(data_r2r['episodes']))
+        results_iterator = tqdm(executor.map(p_process_r2r, data_r2r['episodes'], chunksize=32), total=len(data_r2r['episodes']))
         for episode_res in results_iterator:
             all_results.extend(episode_res)
         print(f"Finished R2R. Total samples: {len(all_results)}")
@@ -202,7 +209,7 @@ def main():
         # --- Process RxR ---
         print("\nProcessing RxR dataset...")
         p_process_rxr = partial(process_episode_vlnce, img_root=img_root_rxr)
-        results_iterator = tqdm(executor.map(p_process_rxr, data_rxr['episodes']), total=len(data_rxr['episodes']))
+        results_iterator = tqdm(executor.map(p_process_rxr, data_rxr['episodes'], chunksize=64), total=len(data_rxr['episodes']))
         for episode_res in results_iterator:
             all_results.extend(episode_res)
         print(f"Finished RxR. Total samples: {len(all_results)}")
