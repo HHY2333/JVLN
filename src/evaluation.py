@@ -41,7 +41,7 @@ from io import BytesIO
 from qwen_vl_utils import extract_vision_info
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from qwen_vl.model.vggt.utils.load_fn import load_and_preprocess_images
-from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationForJanusVLN
+from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationForJanusVLN, get_progressive_compression_ratio
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 
@@ -177,6 +177,13 @@ class VLNEvaluator:
                 time_ids = []
                 action_seq = []
                 self.model.model.past_key_values_vggt = None
+                # ----------------------------------------------------------------
+                # 推理特征缓存重置（Inference Feature Cache Reset）
+                # 每个 episode 开始时清空 fused_feature_cache 和 vggt_step，
+                # 确保不同 episode 的历史特征和 VGGT 时序位置不混淆。
+                # ----------------------------------------------------------------
+                self.model.model.fused_feature_cache = []
+                self.model.model.vggt_step = 0
                 
                 while not env.episode_over:
                     
@@ -190,15 +197,43 @@ class VLNEvaluator:
                         
                     history_len = len(rgb_list) - 1 
                     
-                    if history_len <= self.num_history:
-                        history_images = rgb_list[:history_len]
-                        images = history_images + [rgb_list[-1]]
+                    # -------------------------------------------------------------------
+                    # 推理时历史特征采样（Inference History Feature Sampling）
+                    #
+                    # 新设计：不再重新编码历史 RGB 帧，而是：
+                    #   1. rgb_list  → 仅用于传给 processor 生成正确数量的 <image_pad> token
+                    #   2. fused_feature_cache → 存储每步编码后的融合特征 f_t，
+                    #      历史帧直接从此缓存取，传给 forward() 做渐进压缩，供 LLM 使用
+                    #
+                    # 采样策略：以步长 ∆=2 从最近历史帧向过去采样（与 create_data.py 一致），
+                    # PIL 和特征使用完全相同的采样索引，保证两者对齐。
+                    # -------------------------------------------------------------------
+                    TEMPORAL_STRIDE = 4  # 论文 ∆=4，与 create_data.py 保持一致
+                    cache = self.model.model.fused_feature_cache  # 已缓存的融合特征列表
+                    if history_len == 0:
+                        # 第一步：无历史帧
+                        history_pil = []
+                        history_features = []
+                    elif history_len <= self.num_history:
+                        # 历史帧不足，全部使用
+                        history_pil = rgb_list[:history_len]
+                        history_features = cache[:history_len]
                     else:
-                        indices = np.linspace(0, history_len, self.num_history + 1, dtype=int)
-                        images = [rgb_list[i] for i in indices]
+                        # 从最近历史帧以步长 ∆ 向过去采样，保持时间正序
+                        hist_indices = list(range(history_len - 1, -1, -TEMPORAL_STRIDE))
+                        hist_indices = sorted(hist_indices[:self.num_history])
+                        history_pil = [rgb_list[idx] for idx in hist_indices]
+                        history_features = [cache[idx] for idx in hist_indices]
+                    images = history_pil + [rgb_list[-1]]  # 仅用于 processor 分词
                     
                     
-                    action = self.model.call_model(images, episode_instruction,step_id)[0]
+                    action = self.model.call_model(
+                        rgb_list[-1],           # 当前帧（仅此帧通过编码器）
+                        episode_instruction,
+                        step_id,
+                        history_pil_images=history_pil,      # 历史 PIL，仅用于 processor 分词
+                        history_features=history_features,   # 历史融合特征，用于 forward() 压缩
+                    )[0]
                     
                     if info['top_down_map'] is not None and should_save_video:
                         frame = observations_to_image({'rgb':observations['rgb']}, info)
@@ -268,12 +303,27 @@ class JanusVLN_Inference:
 
     def call_model(
         self,
-        observations, 
+        observations,              # 当前帧 PIL image（仅编码此帧）
         task,
         step_id,
-        add_frame_index: bool=False,
+        history_pil_images: list = None,  # 历史帧 PIL list，仅供 processor 生成 <image_pad> 数量
+        history_features: list = None,    # 历史融合特征 [(feat, hm, wm)]，来自 fused_feature_cache
+        add_frame_index: bool = False,
         gen_kwargs: dict = {},
     ):
+        # =====================================================================
+        # call_model 核心设计（推理高效路径）
+        #
+        # 1. 构建包含所有帧（历史 PIL + 当前帧）的消息，传给 processor 生成含正确
+        #    <image_pad> 数量的 input_ids（全分辨率）。
+        # 2. images_vggt 只存当前帧（VGGT KV cache 已携带历史几何上下文）。
+        # 3. 若有历史特征（history_features），对 input_ids 做修补：
+        #    将历史帧的全分辨率 <image_pad> 块替换为压缩后的数量，
+        #    同时更新 image_grid_thw 为压缩值（供 forward 内 get_rope_index 使用）。
+        # 4. 裁剪 pixel_values，只保留当前帧的 patch 数据（历史帧特征来自缓存）。
+        # 5. 将 history_features 传给 model.generate → forward，
+        #    在 forward 内完成历史特征的渐进压缩 + 拼接 + <image_pad> 填充。
+        # =====================================================================
         
         messages = []
         message = [
@@ -284,23 +334,27 @@ class JanusVLN_Inference:
         context = f"These images are your historical observations and your current observation.\n Your task is to {task} \n You should take one of the following actions:\n MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
         patch_size = self.processor.image_processor.patch_size
         merge_size = self.processor.image_processor.merge_size
+
+        # -------------------------------------------------------------------
+        # 构建所有帧列表（历史 PIL + 当前帧），用于 processor 分词
+        # Build full frame list (history PIL + current) for processor tokenization.
+        # 历史 PIL 的像素数据仅用于 processor 计算 <image_pad> 数量和 image_grid_thw，
+        # 不会送入神经网络再次编码（历史特征来自 fused_feature_cache）。
+        # -------------------------------------------------------------------
+        current_pil = observations if isinstance(observations, Image.Image) else observations[-1]
+        history_pil_images = history_pil_images or []
+        all_pil_images = history_pil_images + [current_pil]  # 时间正序：早→晚（最后为当前帧）
+
         for i in enumerate([task]):
     
-            visual = observations
-            if isinstance(visual, Image.Image): 
-                message.append({"role": "user", "content": [{"type": "image", "image": visual}, {"type": "text", "text": context}]})
-            elif isinstance(visual, (list, tuple)) and all(isinstance(v, Image.Image) for v in visual):  
-                image_content = []
-                image_count = 0
-                for v in visual:
-                    if add_frame_index:
-                        image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})    
-                    image_content.append({"type": "image", "image": v})
-                    image_count += 1
-                message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
-            else:
-                message.append({"role": "user", "content": [{"type": "text", "text": context}]})
-
+            image_content = []
+            image_count = 0
+            for v in all_pil_images:
+                if add_frame_index:
+                    image_content.append({"type": "text", "text": "Frame-{}: ".format(image_count)})
+                image_content.append({"type": "image", "image": v})
+                image_count += 1
+            message.append({"role": "user", "content": image_content + [{"type": "text", "text": context}]})
             messages.append(message)
 
         
@@ -311,6 +365,7 @@ class JanusVLN_Inference:
         for message in messages:
             vision_info = extract_vision_info(message)
             cur_images_vggt = []
+            n_vision = len(vision_info)
             for i, ele in enumerate(vision_info):
                 if "image" in ele:
                     image = ele["image"]
@@ -329,8 +384,16 @@ class JanusVLN_Inference:
                 assert isinstance(image, Image.Image), f"Unsupported image type: {type(image)}"
                 image = load_and_preprocess_images([image])[0]
 
-                if i == len(vision_info) - 1:
-                    cur_images_vggt.append(image)
+                # -------------------------------------------------------------------
+                # images_vggt 只存当前帧（最后一帧）
+                # Only append current frame (last) to images_vggt for VGGT encoding.
+                #
+                # 历史帧的 3D 几何上下文由 VGGT 的 KV cache (past_key_values_vggt) 保留，
+                # 无需再次经过 VGGT 编码，节省大量 GPU 计算。
+                # 历史帧的视觉语义上下文由 fused_feature_cache 提供，传给 forward() 做压缩。
+                # -------------------------------------------------------------------
+                if i == n_vision - 1:
+                    cur_images_vggt.append(image)  # 仅当前帧
 
                 _, height, width = image.shape
                 if (width // patch_size) % merge_size > 0:
@@ -351,6 +414,75 @@ class JanusVLN_Inference:
             do_rescale=False
         )
         device = self.model.device
+
+        # =====================================================================
+        # input_ids 修补 + pixel_values 裁剪（仅在有历史特征缓存时执行）
+        #
+        # 问题背景：
+        #   processor 按全分辨率计算所有帧的 <image_pad> 数量（in input_ids）
+        #   和 image_grid_thw；但 forward() 的推理路径对历史帧做了渐进压缩，
+        #   输出 token 数小于全分辨率。若不修补，<image_pad> 数量与实际 token 数
+        #   不一致，导致 masked_scatter 报错。
+        #
+        # 解决方案：
+        #   1. 用与 data_qwen.py / forward() 完全相同的压缩公式，计算每帧压缩后的 token 数
+        #   2. 替换 input_ids 中历史帧的全分辨率 <image_pad> 块 → 压缩大小块
+        #   3. 更新 image_grid_thw 中历史帧的 grid → 压缩 grid（供 get_rope_index 使用）
+        #   4. 裁剪 pixel_values，只保留当前帧的 patch（历史帧特征来自缓存，不再编码）
+        # =====================================================================
+        if history_features:
+            image_token_id = self.model.config.image_token_id
+            orig_grid_thw = inputs['image_grid_thw']   # [n_imgs, 3]，全分辨率
+            n_images = len(orig_grid_thw)
+
+            mem_group_size = getattr(self.model.config, 'memory_group_size', 3)
+            mem_max_order  = getattr(self.model.config, 'memory_max_compression_order', 3)
+
+            # 计算每帧压缩后的 token 数和 grid
+            full_tok = [int(thw[0] * thw[1] * thw[2]) // merge_size ** 2 for thw in orig_grid_thw]
+            comp_tok = []
+            comp_grid = []
+            for idx, thw in enumerate(orig_grid_thw):
+                if idx == n_images - 1:          # 当前帧：不压缩
+                    comp_tok.append(full_tok[idx])
+                    comp_grid.append(thw)
+                else:
+                    pos = n_images - 2 - idx     # 0 = 最近历史帧
+                    r = get_progressive_compression_ratio(pos, mem_group_size, mem_max_order)
+                    T, H, W = int(thw[0]), int(thw[1]), int(thw[2])
+                    h_m, w_m = H // merge_size, W // merge_size
+                    h_c, w_c = max(1, h_m // r), max(1, w_m // r)
+                    comp_tok.append(T * h_c * w_c)
+                    comp_grid.append(
+                        torch.tensor([T, h_c * merge_size, w_c * merge_size],
+                                     dtype=thw.dtype, device=thw.device)
+                    )
+
+            # 修补 input_ids：用压缩块替换全分辨率块（batch_size=1）
+            seq = inputs['input_ids'][0].tolist()
+            patched, img_idx, i = [], 0, 0
+            while i < len(seq):
+                if seq[i] == image_token_id and img_idx < n_images:
+                    j = i
+                    while j < len(seq) and seq[j] == image_token_id:
+                        j += 1
+                    patched.extend([image_token_id] * comp_tok[img_idx])
+                    img_idx += 1
+                    i = j
+                else:
+                    patched.append(seq[i])
+                    i += 1
+            inputs['input_ids'] = torch.tensor(
+                [patched], dtype=inputs['input_ids'].dtype, device=inputs['input_ids'].device
+            )
+            inputs['attention_mask'] = torch.ones_like(inputs['input_ids'])
+            inputs['image_grid_thw'] = torch.stack(comp_grid).to(orig_grid_thw.device)
+
+            # 裁剪 pixel_values：只保留当前帧（最后一帧）的 patch 数据
+            # n_raw_patches[i] = T_i * H_i * W_i（T/H/W 来自原始全分辨率 grid_thw）
+            n_raw = [int(thw[0] * thw[1] * thw[2]) for thw in orig_grid_thw]
+            cur_start = sum(n_raw[:-1])
+            inputs['pixel_values'] = inputs['pixel_values'][cur_start:]
 
         inputs["images_vggt"] = [feat.to(device) for feat in images_vggt]
         inputs = inputs.to(device)
@@ -375,6 +507,9 @@ class JanusVLN_Inference:
             top_p=gen_kwargs["top_p"],
             num_beams=gen_kwargs["num_beams"],
             max_new_tokens=gen_kwargs["max_new_tokens"],
+            # 历史融合特征（来自 fused_feature_cache），传入 forward() 做渐进压缩
+            # 若无历史（第一步或无缓存），传 None，触发 forward() 的兜底逻辑
+            history_features=history_features if history_features else None,
         )
 
         generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
@@ -395,7 +530,7 @@ def eval():
     parser.add_argument("--eval_split", type=str, default='val_unseen')
     parser.add_argument("--output_path", type=str, default='./results/val_unseen/streamvln')
     parser.add_argument("--save_video", action="store_true", default=False)
-    parser.add_argument("--num_history", type=int, default=8)
+    parser.add_argument("--num_history", type=int, default=12)  # 论文窗口 W=12
     parser.add_argument("--model_max_length", type=int, default=4096,
                         help= "Maximum sequence length. Sequences will be right padded (and possibly truncated).")
     parser.add_argument("--save_video_ratio", type=float, default=0.05, help="0~1")

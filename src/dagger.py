@@ -157,6 +157,9 @@ class DAggerCollector:
         action_seq, action_mask = [], []
         rgb_list,  time_ids = [], []
         evaluator.model.model.past_key_values_vggt = None
+        # 推理特征缓存重置（每个 episode 开始时清空）
+        evaluator.model.model.fused_feature_cache = []
+        evaluator.model.model.vggt_step = 0
         metrics = None
         accumulated_error = 0 
 
@@ -193,14 +196,33 @@ class DAggerCollector:
                             left_expert_actions_num = self.args.num_future_steps - 1 
                         else:    
                             history_len = len(rgb_list) - 1  
-                            if history_len <= evaluator.num_history:
-                                history_images = rgb_list[:history_len]
-                                images = history_images + [rgb_list[-1]]
+                            # -------------------------------------------------------------------
+                            # 推理时历史特征采样（与 evaluation.py 保持一致）
+                            # 以步长 ∆=2 从最近历史帧向过去采样；
+                            # PIL 和缓存特征使用完全相同的索引，保证对齐。
+                            # -------------------------------------------------------------------
+                            TEMPORAL_STRIDE = 4  # 论文 ∆=4，与 create_data.py 保持一致
+                            cache = evaluator.model.model.fused_feature_cache
+                            if history_len == 0:
+                                history_pil = []
+                                history_features = []
+                            elif history_len <= evaluator.num_history:
+                                history_pil = rgb_list[:history_len]
+                                history_features = cache[:history_len]
                             else:
-                                indices = np.linspace(0, history_len, evaluator.num_history + 1, dtype=int)
-                                images = [rgb_list[i] for i in indices]
+                                hist_indices = sorted(
+                                    list(range(history_len - 1, -1, -TEMPORAL_STRIDE))[:evaluator.num_history]
+                                )
+                                history_pil = [rgb_list[idx] for idx in hist_indices]
+                                history_features = [cache[idx] for idx in hist_indices]
                             
-                            action = evaluator.model.call_model(images, instructions,step_id)[0]
+                            action = evaluator.model.call_model(
+                                rgb_list[-1],
+                                instructions,
+                                step_id,
+                                history_pil_images=history_pil,
+                                history_features=history_features,
+                            )[0]
                             if action in evaluator.actions2idx:
                                 action = evaluator.actions2idx[action][0]
                             else:

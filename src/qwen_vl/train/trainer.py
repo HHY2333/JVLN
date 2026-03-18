@@ -147,6 +147,15 @@ def replace_qwen2_vl_attention_class():
         _update_causal_mask
     )
 
+    # 关键修复：本地的 modeling_qwen2_5_vl.py 通过
+    # `from transformers.modeling_flash_attention_utils import _flash_attention_forward`
+    # 创建了独立的函数引用，上面对 transformers 模块的 monkey-patch 不会影响它。
+    # 因此必须单独替换本地模块中的引用，否则本地模型仍调用标准版实现，
+    # 将 cu_seqlens (1D) 当作 2D attention_mask 处理，导致 sum/pad 报错。
+    import qwen_vl.model.modeling_qwen2_5_vl as _local_qwen2_5_vl
+    _local_qwen2_5_vl._flash_attention_forward = _flash_attention_forward
+    _local_qwen2_5_vl.Qwen2_5_VLModel._update_causal_mask = _update_causal_mask
+
 
 def print_trainable_parameters_visual(self) -> None:
     """

@@ -146,6 +146,40 @@ class Qwen2RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ===========================================================================
+# 渐进式记忆压缩工具函数（Progressive Memory Compression Utility）
+# 论文参考：Efficient-VLN, Section 3.3 "Progressive Memory Representation"
+#
+# 核心思路：模仿人类遗忘机制，对历史观测帧按时间远近施加递增的空间压缩。
+# 历史帧按距当前帧的远近分为若干组（每组 K 帧），
+# 最近组压缩 2×2，次近组压缩 4×4，以此类推，直至最大压缩阶数。
+# 当前帧不压缩，保持全分辨率。
+# ===========================================================================
+def get_progressive_compression_ratio(
+    pos_from_current: int,
+    memory_group_size: int = 3,
+    max_compression_order: int = 3,
+) -> int:
+    """
+    计算历史帧的渐进式空间压缩比。
+
+    Args:
+        pos_from_current: 历史帧与当前帧的距离（0 = 最近历史帧，1 = 次近历史帧，...）
+        memory_group_size: K，每组帧数。每 K 帧为一组，同组内压缩比相同。
+        max_compression_order: 最大压缩阶数，压缩比 = 2^order，上限为 2^max_order。
+
+    Returns:
+        压缩因子 r。历史帧在空间上下采样 r×r 倍（即 r 倍高度 × r 倍宽度）。
+        - group 0（最近 K 帧）: r = 2   → 2×2 下采样
+        - group 1（次近 K 帧）: r = 4   → 4×4 下采样
+        - group 2（再次 K 帧）: r = 8   → 8×8 下采样（若 max_compression_order=3）
+    """
+    group = pos_from_current // memory_group_size
+    # group 0 → order 1 → ratio 2；group n → order n+1（上限 max_compression_order）
+    compression_order = min(group + 1, max_compression_order)
+    return 2 ** compression_order
+
+
 class VGGTMerger(nn.Module):
     def __init__(self, output_dim: int, hidden_dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
         super().__init__()
@@ -183,11 +217,16 @@ class Qwen2_5_VLPatchMerger(nn.Module):
 def apply_rotary_pos_emb_flashatt(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.chunk(2, dim=-1)[0].contiguous()
-    sin = sin.chunk(2, dim=-1)[0].contiguous()
-    q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
-    k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
-    return q_embed, k_embed
+    # 用纯 PyTorch 实现旋转位置编码，避免 flash_attn triton 内核版本不兼容问题
+    # (flash_attn >= 2.6 requires torch.library.wrap_triton which is unavailable here)
+    # 这里保持与 apply_rotary_pos_emb_vision 一致的数学与张量形状处理。
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
 
 
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
@@ -1673,6 +1712,38 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         self.config.reference_frame = getattr(config, "reference_frame", "first")
         self.lam = getattr(config, "lam", 0.2)
 
+        # -----------------------------------------------------------------------
+        # 渐进式记忆压缩配置（Progressive Memory Compression Config）
+        # 论文 Efficient-VLN Section 3.3：对历史帧按时间远近分组下采样，
+        # 模拟人类遗忘机制：越近的记忆越清晰，越远的记忆越模糊。
+        #
+        # memory_group_size   (K)      : 每组帧数，同组内使用相同压缩比。
+        # memory_max_compression_order : 最大压缩阶数，压缩比 = 2^order，
+        #                                group 0 → 2×2，group 1 → 4×4，
+        #                                group (max_order-1) → 2^max_order × 同。
+        # -----------------------------------------------------------------------
+        self.memory_group_size = getattr(config, "memory_group_size", 4)          # K=4，每组4帧，3层×4=12=窗口大小
+        self.memory_max_compression_order = getattr(config, "memory_max_compression_order", 3)  # 最大压缩阶数（3层）
+
+        # -----------------------------------------------------------------------
+        # 推理时融合特征缓存（Inference Fused Feature Cache）
+        #
+        # 设计思路（区别于训练模式）：
+        #   训练：每个 sample 包含所有帧的像素数据，forward() 全部重新编码。
+        #   推理：每步只需编码当前帧，历史特征从 fused_feature_cache 直接取，
+        #         无需重新过视觉编码器和 VGGT（仅 VGGT KV cache 保留几何上下文）。
+        #
+        # fused_feature_cache: List of (feat: Tensor[hm*wm, hidden_size], hm: int, wm: int)
+        #   - feat: 当前步融合后的全分辨率特征 f_t = v_t + lam * g_t
+        #   - hm, wm: merge 后的空间尺寸（压缩时使用）
+        #   在 episode 开始时由 evaluation.py 清空，每步 forward() 执行后追加一条。
+        #
+        # vggt_step: VGGT 累计帧计数，用于时序位置编码 past_frame_idx。
+        #   每个 episode 开始时由 evaluation.py 重置为 0。
+        # -----------------------------------------------------------------------
+        self.fused_feature_cache: list = []
+        self.vggt_step: int = 0
+
         self.kv_cache_vggt = StartRecentKVCache(
                 start_size=8,          
                 recent_size=48,     
@@ -1931,6 +2002,7 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         images_vggt: Optional[List[torch.Tensor]] = None,
         boxes: Optional[List[torch.Tensor]] = None,
         tag: str = None,
+        history_features: Optional[List] = None,  # 推理时历史融合特征，格式: List[(feat, hm, wm)]
         **kwargs,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -1982,77 +2054,348 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
             self.vggt.eval()
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
-                batch_size = inputs_embeds.shape[0]
-                image_embeds_3d = []
-                teacher_outputs = []
-                for i in range(batch_size):
-                    if images_vggt[i].shape[0] > 0:
-                        # n_image = images_vggt[i].shape[0]
-                        n_image = 1
-                        height, width = images_vggt[i].shape[-2:]
-                        patch_size = self.config.vision_config.patch_size
-                        merge_size = self.config.vision_config.spatial_merge_size
-                        h_grid, w_grid = height // patch_size, width // patch_size
-                        h_grid_after_merge, w_grid_after_merge = h_grid // merge_size, w_grid // merge_size
-                        new_height = h_grid_after_merge * (patch_size * merge_size)
-                        new_width = w_grid_after_merge * (patch_size * merge_size)
+                # ===================================================================
+                # 渐进式记忆特征提取与融合（Progressive Memory Feature Extraction）
+                # 实现论文 Efficient-VLN Section 3.2 & 3.3
+                #
+                # 分为两种执行路径：
+                #
+                # [推理路径] history_features is not None
+                #   pixel_values  = 仅当前帧的 patch 数据
+                #   image_grid_thw = [历史帧压缩 grid..., 当前帧全分辨率 grid]
+                #   images_vggt   = 仅当前帧 [1, C, H, W]，VGGT KV cache 提供历史几何上下文
+                #   history_features = [(feat_k, hm_k, wm_k), ...] 来自 fused_feature_cache
+                #   → 只对当前帧编码，历史特征直接压缩复用，效率高
+                #
+                # [训练路径] history_features is None
+                #   pixel_values  = 所有帧（历史 + 当前）的 patch 数据
+                #   image_grid_thw = 所有帧的全分辨率 grid
+                #   images_vggt   = 所有帧的像素张量
+                #   → 从头完整编码所有帧，支持单步训练样本
+                # ===================================================================
 
-                        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-                        with torch.no_grad():
-                            with torch.cuda.amp.autocast(dtype=dtype):
-                                if not self.config.reference_frame=="first":
-                                    images_vggt[i] = torch.flip(images_vggt[i], dims=(0,))
-                                
-                                if self.mode == "evaluation": 
-                                    if self.past_key_values_vggt is None:
-                                        self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
-                                else:
-                                    self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
+                # -----------------------------------------------------------------------
+                # batch_size 说明：
+                #   - data_flatten=False: input_ids.shape[0] == len(images_vggt)，两者相等。
+                #   - data_flatten=True:  多个 sample 被打包成一条长序列，
+                #     input_ids.shape[0] = 1，但 images_vggt 仍有 N 个 sample 的帧张量。
+                #     此时必须用 len(images_vggt) 作为循环计数，否则只处理第 0 个 sample，
+                #     造成 image_embeds token 数 < input_ids 中 <image_pad> 数量的不匹配。
+                # -----------------------------------------------------------------------
+                batch_size = len(images_vggt) if images_vggt is not None else inputs_embeds.shape[0]
+                patch_size = self.config.vision_config.patch_size
+                merge_size = self.config.vision_config.spatial_merge_size
 
-                                for k, frame in enumerate(images_vggt[i]):
-                                    images = frame.unsqueeze(0).unsqueeze(0) 
-                                    aggregator_output = self.vggt.aggregator(
-                                        images, 
-                                        past_key_values=self.past_key_values_vggt,
-                                        use_cache=True, 
-                                        past_frame_idx=k
-                                    )
-                                    
-                                    if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
-                                        aggregated_tokens, patch_start_idx, past_key_values_vggt = aggregator_output
-                                    else:
-                                        aggregated_tokens, patch_start_idx = aggregator_output
+                if history_features is not None:
+                    # ==============================================================
+                    # 推理路径：特征缓存复用，仅编码当前帧
+                    # Inference Path: Reuse feature cache, only encode current frame
+                    # ==============================================================
+                    # pixel_values:   当前帧 patch 数据，shape [cur_T*H_patches*W_patches, C*pH*pW]
+                    # image_grid_thw: [comp_hist_0_grid, ..., full_cur_grid]（n_hist+1 entries）
+                    # images_vggt[0]: [1, C, H, W] 当前帧像素
+                    # history_features: [(feat_k, hm_k, wm_k)] 历史融合特征列表（已缓存）
 
-                                    self.past_key_values_vggt = past_key_values_vggt
-                                    if self.mode == "evaluation" and self.past_key_values_vggt is not None:
-                                        self.past_key_values_vggt = self.kv_cache_vggt(self.past_key_values_vggt)
+                    pixel_values = pixel_values.type(self.visual.dtype)
 
-                                    features = aggregated_tokens[-2][0,:, patch_start_idx:]
+                    # ----------------------------------------------------------
+                    # Step A: 仅对当前帧调用 Qwen 视觉编码器
+                    #         Only encode current frame with Qwen visual encoder
+                    # image_grid_thw[-1:] = 当前帧的全分辨率 grid（T, H, W），仅 1 条
+                    # pixel_values 已在 call_model() 中裁剪为当前帧的 patch 数据
+                    # ----------------------------------------------------------
+                    image_embeds_cur = self.visual(pixel_values, grid_thw=image_grid_thw[-1:])
+                    # image_embeds_cur: [h_merged * w_merged, hidden_size]
 
-                        if not self.config.reference_frame=="first":
-                            features = torch.flip(features, dims=(0,))
+                    cur_grid = image_grid_thw[-1]
+                    h_merged = int(cur_grid[1]) // merge_size   # 当前帧 merge 后高度
+                    w_merged = int(cur_grid[2]) // merge_size   # 当前帧 merge 后宽度
+                    h_grid   = int(cur_grid[1])                 # = h_merged * merge_size
+                    w_grid   = int(cur_grid[2])                 # = w_merged * merge_size
 
-                        # using QwenPatchMerger
-                        features = features.view(n_image, h_grid, w_grid, -1)
-                        features = features[:, :h_grid_after_merge * merge_size, :w_grid_after_merge * merge_size, :].contiguous()
-                        features = features.view(n_image, h_grid_after_merge, merge_size, w_grid_after_merge, merge_size, -1)
-                        features = features.permute(0, 1, 3, 2, 4, 5).contiguous().to(self.visual.dtype)
-                        image_embeds_3d.append(self.merger(features))
+                    # ----------------------------------------------------------
+                    # Step B: 仅对当前帧运行 VGGT（KV cache 提供历史几何上下文）
+                    #         Run VGGT on current frame only; KV cache holds historical geometry
+                    #
+                    # 相比训练路径：不再循环多帧，只处理 images_vggt[0] 这 1 帧
+                    # vggt_step 记录 episode 内累计帧数，用于 VGGT 的 past_frame_idx 时序编码
+                    # ----------------------------------------------------------
+                    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                    # inference_mode 比 no_grad 更快：额外禁用 view 追踪，VGGT 为冻结模型适合用此模式
+                    with torch.inference_mode():
+                        with torch.amp.autocast('cuda', dtype=dtype):
+                            frames = images_vggt[0]  # [1, C, H, W]
+                            if not self.config.reference_frame == "first":
+                                frames = torch.flip(frames, dims=(0,))
 
-                image_embeds_3d = torch.cat(image_embeds_3d, dim=0).to(self.visual.dtype)
+                            if self.past_key_values_vggt is None:
+                                self.past_key_values_vggt = [None] * self.vggt.aggregator.depth
 
-                pixel_values = pixel_values.type(self.visual.dtype)
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-                k = image_embeds.shape[0] // image_embeds_3d.shape[0]
-                image_embeds_3d = image_embeds_3d.repeat(k, 1)
-                image_embeds = image_embeds + self.lam * image_embeds_3d
+                            # past_frame_idx = 本 episode 累计帧数（=历史帧数）
+                            # 确保 VGGT 时序位置编码正确
+                            aggregator_output = self.vggt.aggregator(
+                                frames.unsqueeze(0),  # [1, 1, C, H, W]
+                                past_key_values=self.past_key_values_vggt,
+                                use_cache=True,
+                                past_frame_idx=self.vggt_step,
+                            )
+
+                            if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
+                                aggregated_tokens, patch_start_idx, past_kv = aggregator_output
+                            else:
+                                aggregated_tokens, patch_start_idx = aggregator_output
+                                past_kv = None
+
+                            self.past_key_values_vggt = past_kv
+                            if self.past_key_values_vggt is not None:
+                                self.past_key_values_vggt = self.kv_cache_vggt(self.past_key_values_vggt)
+
+                            # 取倒数第 2 层 patch 特征（跳过 CLS token）
+                            feat_vggt = aggregated_tokens[-2][0, :, patch_start_idx:]  # [h_grid*w_grid, 2048]
+                            self.vggt_step += 1  # 累计帧计数 +1
+
+                    # 投影 VGGT 特征到 LLM 维度 → g_t（与训练路径完全一致）
+                    feat_vggt = feat_vggt.view(1, h_grid, w_grid, -1)
+                    feat_vggt = feat_vggt[:, :h_merged * merge_size, :w_merged * merge_size, :].contiguous()
+                    feat_vggt = feat_vggt.view(1, h_merged, merge_size, w_merged, merge_size, -1)
+                    feat_vggt = feat_vggt.permute(0, 1, 3, 2, 4, 5).contiguous().to(self.visual.dtype)
+                    g_t = self.merger(feat_vggt)  # [h_merged * w_merged, hidden_size]
+
+                    # ----------------------------------------------------------
+                    # Step C: 融合当前帧 f_t = v_t + lam * g_t，并存入缓存
+                    #         Fuse current frame and append to fused_feature_cache
+                    # 后续步骤直接从缓存取此特征，无需重新编码
+                    # ----------------------------------------------------------
+                    f_t = image_embeds_cur + self.lam * g_t  # [h_merged * w_merged, hidden_size]
+                    # 仅在 prefill 阶段（pixel_values 不为 None）追加，autoregressive 步骤跳过
+                    self.fused_feature_cache.append((f_t.detach(), h_merged, w_merged))
+
+                    # ----------------------------------------------------------
+                    # Step D: 对历史缓存特征做渐进式压缩，与当前帧拼接
+                    #         Apply progressive compression to history cache features,
+                    #         then concatenate with current frame tokens
+                    #
+                    # history_features: [(feat_0, hm_0, wm_0), ..., (feat_{n-1}, hm_{n-1}, wm_{n-1})]
+                    #   feat_0 = 最早历史帧，feat_{n-1} = 最近历史帧（时间正序）
+                    # pos_from_current: 0 = 最近历史帧 → 最小压缩；较早帧 → 更大压缩
+                    # ----------------------------------------------------------
+                    all_embeds = []
+                    n_hist = len(history_features)
+                    for k, (feat, hm, wm) in enumerate(history_features):
+                        pos = n_hist - 1 - k   # 0 = 最近历史帧
+                        r = get_progressive_compression_ratio(
+                            pos, self.memory_group_size, self.memory_max_compression_order
+                        )
+                        h_c = max(1, hm // r)
+                        w_c = max(1, wm // r)
+                        feat_2d = feat.view(hm, wm, -1).permute(2, 0, 1).unsqueeze(0)
+                        feat_comp = F.adaptive_avg_pool2d(feat_2d, (h_c, w_c))
+                        feat_comp = feat_comp.squeeze(0).permute(1, 2, 0).reshape(-1, feat.shape[-1])
+                        all_embeds.append(feat_comp.to(self.visual.dtype))
+
+                    all_embeds.append(f_t)  # 当前帧不压缩，直接追加（时间顺序：早→晚）
+                    image_embeds = torch.cat(all_embeds, dim=0)
+
+                else:
+                    # ==============================================================
+                    # 训练路径：所有帧从头编码（原有逻辑，保持不变）
+                    # Training Path: Full encoding of all frames from scratch
+                    # ==============================================================
+
+                # ------------------------------------------------------------------
+                # Step 1: Qwen 视觉编码器处理所有帧（历史 + 当前）的原始像素
+                #         Process all frames (history + current) with Qwen visual encoder
+                # 输出 image_embeds_2d: [sum_over_all_frames(T_k * H_k/merge * W_k/merge), hidden_size]
+                # ------------------------------------------------------------------
+                    pixel_values = pixel_values.type(self.visual.dtype)
+                    image_embeds_2d = self.visual(pixel_values, grid_thw=image_grid_thw)
+
+                    # 预计算每张图片的全分辨率 token 数，用于后续按帧切分 image_embeds_2d
+                    # Pre-compute full-resolution token count per image for later frame-wise splitting
+                    full_res_tokens_per_image = [
+                        (thw[0] * thw[1] * thw[2] // (merge_size ** 2)).item()
+                        for thw in image_grid_thw
+                    ]
+
+                # ------------------------------------------------------------------
+                # Step 2: 按 batch item 循环，完成 VGGT 提取 → 融合 → 渐进式压缩
+                #         Per-batch-item: VGGT extraction → fusion → progressive compression
+                # 仅在训练路径执行（推理路径已在 if history_features is not None 中生成 image_embeds）
+                # ------------------------------------------------------------------
+                if history_features is None:
+                  all_compressed_embeds = []  # 收集每个 batch item 压缩后的 image embeds
+                  img_global_offset = 0       # 当前 batch item 在全局 image_grid_thw 中的偏移
+
+                  for i in range(batch_size):
+                    n_frames = images_vggt[i].shape[0]  # 该 batch item 的帧数（历史 + 当前）
+
+                    if n_frames == 0:
+                        # 没有视觉帧（不应发生，保守处理）
+                        img_global_offset += 0
+                        continue
+
+                    # 取该 batch item 的空间尺寸（所有帧尺寸相同）
+                    height, width = images_vggt[i].shape[-2:]
+                    h_grid = height // patch_size   # VGGT patch 网格高度（未合并）
+                    w_grid = width // patch_size    # VGGT patch 网格宽度（未合并）
+                    h_merged = h_grid // merge_size  # Qwen merge 后的特征图高度
+                    w_merged = w_grid // merge_size  # Qwen merge 后的特征图宽度
+
+                    # 从全局 image_embeds_2d 中切分出该 batch item 各帧的 2D 特征
+                    # Slice 2D visual features for this batch item from the global tensor
+                    item_tokens_per_frame = full_res_tokens_per_image[img_global_offset:img_global_offset + n_frames]
+                    item_start_token = sum(full_res_tokens_per_image[:img_global_offset])
+                    item_total_tokens = sum(item_tokens_per_frame)
+                    item_embeds_2d = image_embeds_2d[item_start_token:item_start_token + item_total_tokens]
+                    # item_embeds_2d: [item_total_tokens, hidden_size]
+
+                    # --------------------------------------------------------------
+                    # Step 2a: VGGT 全帧并行处理（use_cache=False + causal mask）
+                    #          VGGT all-frames-at-once with causal masking (training path)
+                    #
+                    # 使用 causal mask 的单次 forward 在数学上等价于逐帧 KV cache 推理，
+                    # 但将 n_frames 次串行调用减少为 1 次，并行处理所有帧。
+                    # --------------------------------------------------------------
+                    all_vggt_features = []  # list of [h_grid * w_grid, 2048] per frame
+
+                    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                    # inference_mode 比 no_grad 更快：额外禁用 view 追踪，VGGT 为冻结模型适合用此模式
+                    with torch.inference_mode():
+                        with torch.amp.autocast('cuda', dtype=dtype):
+                            # reference_frame 配置决定 VGGT 的参考帧方向
+                            # reference_frame config determines the reference frame direction for VGGT
+                            frames = images_vggt[i]
+                            if not self.config.reference_frame == "first":
+                                # 翻转帧序列使最近帧成为 VGGT 的参考帧（第一帧）
+                                frames = torch.flip(frames, dims=(0,))
+
+                            # ------------------------------------------------------------------
+                            # 训练路径优化：用 use_cache=False（一次全帧前向）取代逐帧 KV cache。
+                            # Training path optimization: single all-frames forward (use_cache=False)
+                            # instead of n_frames serial KV-cache calls.
+                            #
+                            # 数学等价性：
+                            # - use_cache=True 串行：第 k 帧的 global attention 只能 attend 帧 0..k-1
+                            # - use_cache=False 全帧：_process_global_attention 构造 causal mask
+                            #   future_frame[i,j]=(frame_id(i)<frame_id(j))→-inf，保证同等因果关系
+                            # 两者输出逐帧特征完全等价（inference_mode + bfloat16 下数值一致）。
+                            #
+                            # 性能提升：
+                            # - 原: n_frames（≈8.64）次串行 aggregator 调用
+                            # - 新: 1 次，patch_embed（DINOv2-ViT）对 n_frames 帧并行
+                            # - 中间激活内存: ~37 MB（vs KV cache 最大 ~1.6 GB）
+                            # ------------------------------------------------------------------
+                            images_all = frames.unsqueeze(0)  # [1, n_frames, C, H, W]
+                            aggregator_output = self.vggt.aggregator(
+                                images_all,
+                                past_key_values=None,
+                                use_cache=False,
+                            )
+                            aggregated_tokens, patch_start_idx = aggregator_output[0], aggregator_output[1]
+                            # aggregated_tokens[-2]: [1, n_frames, P, 2C]，逐帧提取 patch 特征
+                            for k in range(n_frames):
+                                feat_k = aggregated_tokens[-2][0, k, patch_start_idx:]  # [P_patch, 2C]
+                                all_vggt_features.append(feat_k)
+
+                    # 若帧序列已翻转，将特征列表也翻转回时间正序
+                    # Restore temporal order if frames were reversed
+                    if not self.config.reference_frame == "first":
+                        all_vggt_features = list(reversed(all_vggt_features))
+
+                    # --------------------------------------------------------------
+                    # Step 2b: 逐帧融合 2D 视觉特征（vt）和 3D 几何特征（gt）
+                    #          Per-frame fusion: ft = vt + lam * gt  (论文 Section 3.2)
+                    #
+                    # 然后对历史帧应用渐进式空间压缩（Section 3.3）：
+                    # Then apply progressive spatial compression for history frames:
+                    #   - 最近 K 帧: 2×2 下采样  (最近 memory_group_size 帧)
+                    #   - 次近 K 帧: 4×4 下采样
+                    #   - 更早帧:   8×8 下采样（依此类推，上限由 max_compression_order 决定）
+                    #   - 当前帧（最后一帧）: 不压缩，保持全分辨率
+                    # --------------------------------------------------------------
+                    frame_embeds_list = []  # 各帧融合（并可能压缩）后的 token 特征
+                    token_cursor = 0        # 在 item_embeds_2d 中的当前读取位置
+
+                    for k in range(n_frames):
+                        # 取该帧的全分辨率 2D 视觉特征 vt: [h_merged * w_merged, hidden_size]
+                        # Get full-resolution 2D visual features vt for frame k
+                        n_tok_k = item_tokens_per_frame[k]
+                        v_k = item_embeds_2d[token_cursor:token_cursor + n_tok_k]
+                        token_cursor += n_tok_k
+
+                        # 将 VGGT 原始特征投影为 LLM 隐藏维度得到 gt
+                        # Project VGGT raw features to LLM hidden dim to get gt
+                        feat_vggt = all_vggt_features[k]  # [h_grid * w_grid, 2048]
+                        # 重塑为空间图 → 应用与 Qwen 一致的 merge_size 分组 → 通过 VGGTMerger MLP
+                        feat_vggt = feat_vggt.view(1, h_grid, w_grid, -1)
+                        feat_vggt = feat_vggt[:, :h_merged * merge_size, :w_merged * merge_size, :].contiguous()
+                        feat_vggt = feat_vggt.view(1, h_merged, merge_size, w_merged, merge_size, -1)
+                        feat_vggt = feat_vggt.permute(0, 1, 3, 2, 4, 5).contiguous().to(self.visual.dtype)
+                        g_k = self.merger(feat_vggt)  # [h_merged * w_merged, hidden_size]
+
+                        # 几何增强融合：ft = vt + lam * gt（论文 Section 3.2 公式）
+                        # Geometry-enhanced fusion: ft = vt + lam * gt
+                        f_k = v_k + self.lam * g_k  # [h_merged * w_merged, hidden_size]
+
+                        # ----------------------------------------------------------
+                        # Step 2c: 历史帧渐进式空间压缩（Progressive Spatial Compression）
+                        #          仅对历史帧（k < n_frames-1）压缩；当前帧（k == n_frames-1）不变
+                        # ----------------------------------------------------------
+                        if k < n_frames - 1:
+                            # 历史帧：计算距当前帧的位置 pos（0 = 最近历史帧）
+                            # History frame: compute temporal distance from current frame
+                            pos_from_current = n_frames - 2 - k
+                            r = get_progressive_compression_ratio(
+                                pos_from_current,
+                                self.memory_group_size,
+                                self.memory_max_compression_order,
+                            )
+                            # 计算压缩后的空间尺寸
+                            # Compute compressed spatial dimensions
+                            h_c = max(1, h_merged // r)
+                            w_c = max(1, w_merged // r)
+
+                            # 将展平的 token 序列重塑为 2D 空间特征图
+                            # Reshape flat tokens back to 2D spatial feature map: [1, C, h, w]
+                            feat_2d = f_k.view(h_merged, w_merged, -1).permute(2, 0, 1).unsqueeze(0)
+
+                            # 自适应平均池化进行空间下采样（支持任意非整除尺寸）
+                            # Adaptive average pooling for spatial downsampling (handles non-divisible sizes)
+                            feat_compressed = F.adaptive_avg_pool2d(feat_2d, (h_c, w_c))
+                            # feat_compressed: [1, hidden_size, h_c, w_c]
+
+                            # 重新展平为 memory token 序列
+                            # Flatten back to memory token sequence: [h_c * w_c, hidden_size]
+                            f_k = feat_compressed.squeeze(0).permute(1, 2, 0).reshape(-1, f_k.shape[-1])
+                        # else: 当前帧不压缩，f_k 保持 [h_merged * w_merged, hidden_size]
+
+                        frame_embeds_list.append(f_k)
+
+                    # 按时间顺序拼接：[memory tokens（压缩历史）...] + [current tokens（全分辨率）]
+                    # Concatenate in temporal order: compressed history memory tokens + full-res current tokens
+                    # 形成该 batch item 的完整 image embedding 序列
+                    item_compressed_embeds = torch.cat(frame_embeds_list, dim=0)
+                    all_compressed_embeds.append(item_compressed_embeds)
+
+                    img_global_offset += n_frames
+
+                  # 拼接所有 batch item 的 image embeds，顺序与 input_ids 中 <image_pad> 一致
+                  # Concatenate all batch items' compressed image embeds (matches <image_pad> order)
+                  image_embeds = torch.cat(all_compressed_embeds, dim=0).to(self.visual.dtype)
+
+                # 验证 token 数量匹配（input_ids 中 <image_pad> 数量须等于 image_embeds token 数）
+                # Verify token count matches: <image_pad> count in input_ids == image_embeds.shape[0]
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
                     raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                        f"Image features and image tokens do not match after progressive compression: "
+                        f"tokens: {n_image_tokens}, features: {n_image_features}. "
+                        f"Check that data_qwen.py uses the same compression formula as the model."
                     )
 
+                # 将 image_embeds 填入 inputs_embeds 对应 <image_pad> 位置
+                # Fill image_embeds into inputs_embeds at <image_pad> placeholder positions
                 mask = input_ids == self.config.image_token_id
                 mask_unsqueezed = mask.unsqueeze(-1)
                 mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)

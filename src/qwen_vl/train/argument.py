@@ -43,3 +43,12 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    stop_at_step: int = field(
+        default=-1,
+        metadata={"help": "Stop training at this global step (enables staged train+eval loops in shell scripts)."},
+    )
+    total_steps: int = field(
+        default=-1,
+        metadata={"help": "真实训练总步数（用于全局进度条显示）。分段训练时 max_steps 被 stop_at_step 覆盖，"
+                          "total_steps 保留原始总步数供进度回调使用。"},
+    )

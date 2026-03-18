@@ -1,0 +1,11 @@
+src/qwen_vl/model/__pycache__/modeling_qwen2_5_vl.cpython-39.pyc
+src/qwen_vl/model/vggt/utils/__pycache__/load_fn.cpython-39.pyc
+src/qwen_vl/data/__pycache__/data_qwen.cpython-39.pyc
+src/qwen_vl/data/__pycache__/data_qwen.cpython-39.pyc
+
+# Ignore compiled Python files
+__pycache__/
+*.py[cod]
+*.pyc
+train_r2r_rxr.json
+src/qwen_vl/model/__pycache__/modeling_qwen2_5_vl.cpython-39.pyc

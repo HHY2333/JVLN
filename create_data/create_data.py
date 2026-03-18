@@ -9,7 +9,57 @@ from tqdm import tqdm
 import random
 import argparse 
 
-max_history_images = 8
+# =============================================================================
+# 历史帧采样参数（History Frame Sampling Parameters）
+# 论文 Efficient-VLN Section 3.3 "Temporal Sampling"：
+#
+# 以固定步长 ∆ 从历史中均匀采样，减少相邻帧的冗余。
+# 再配合渐进式压缩策略：
+#   - 最近 K 帧的 ft 以 2×2 下采样
+#   - 次近 K 帧以 4×4 下采样
+#   - 更早帧以 8×8 下采样
+# 总 token 上界 ≈ K * S * (1/4 + 1/16 + 1/64 + ...) ≤ K/3 * S
+#
+# max_history_images: 最大保留的历史帧数（不含当前帧）
+#   设为 K * 压缩层数 = 3 * 3 = 9（3 组，每组 3 帧），与论文中 K=3 对应
+# temporal_stride:    采样步长 ∆，每 ∆ 步取一帧历史
+#   ∆=2 表示每 2 步采一帧；轨迹越长，覆盖时间跨度越大
+# =============================================================================
+MAX_HISTORY_IMAGES = 12      # 最大历史帧数（不含当前帧），对应 K=4 × 3 压缩层 = 12（论文 window=12）
+TEMPORAL_STRIDE = 4          # 采样步长 ∆：每 ∆ 步取一帧历史（论文 Section 3.3，∆=4）
+
+
+def sample_history_frames(i: int, total_frames: int) -> list:
+    """
+    给定当前步 i，从 [0, i-1] 中按步长 ∆ 采样历史帧索引，
+    并保证当前帧 i 始终是列表最后一个元素。
+
+    采样策略（论文 Section 3.3 Temporal Sampling）：
+    1. 从最近一帧历史（i-1）开始，每隔 TEMPORAL_STRIDE 步向过去采样
+    2. 采样结果按时间正序排列，最后追加当前帧 i
+    3. 若历史帧不足 MAX_HISTORY_IMAGES，则全取
+
+    Args:
+        i:            当前帧索引（0-indexed，即轨迹第 i 步）
+        total_frames: 轨迹总帧数（仅用于边界检查）
+
+    Returns:
+        采样后的帧索引列表，格式：[hist_idx_0, hist_idx_1, ..., current_idx=i]
+        其中历史帧按时间正序，当前帧在末尾。
+    """
+    if i == 0:
+        # 第 0 步：没有历史帧，只有当前帧
+        return [0]
+
+    # 从 i-1 开始，每 TEMPORAL_STRIDE 步向过去采样，共采 MAX_HISTORY_IMAGES 帧
+    # Start from i-1, sample backwards with stride TEMPORAL_STRIDE
+    history_idxs = list(range(i - 1, -1, -TEMPORAL_STRIDE))   # [i-1, i-1-∆, i-1-2∆, ...]
+    history_idxs = history_idxs[:MAX_HISTORY_IMAGES]           # 截断到最大历史帧数
+    history_idxs = sorted(history_idxs)                        # 恢复时间正序
+
+    # 拼接：[历史帧（时间正序）] + [当前帧]
+    return history_idxs + [i]
+
 
 def process_episode_scalevln(ep, img_root, act_map):
     episode_results = []
@@ -27,10 +77,15 @@ def process_episode_scalevln(ep, img_root, act_map):
 
     num_images = len(img_files)
     for i in range(num_images):
-        if i <= max_history_images:
-            idxs = list(range(i + 1))
-        else:
-            idxs = np.linspace(0, i, 9, dtype=int).tolist()
+        # -------------------------------------------------------------------
+        # 历史帧采样（History Frame Sampling）
+        # 论文 Section 3.3: 以步长 ∆=TEMPORAL_STRIDE 均匀采样历史帧，
+        # 保留最近 MAX_HISTORY_IMAGES 帧，当前帧始终在末尾。
+        # 比原来的 np.linspace 方案更忠实于论文：
+        #   - linspace 均等分割时间轴（固定总帧数）
+        #   - 步长 ∆ 以固定间隔从最近帧向过去采样（自然体现"最近帧最密集"）
+        # -------------------------------------------------------------------
+        idxs = sample_history_frames(i, num_images)
         sampled_imgs = [img_files[j] for j in idxs]
 
         original_len = len(sampled_imgs)
@@ -84,7 +139,7 @@ def process_episode_vlnce(ep, img_root):
 
     for i in range(len(img_files)):
 
-        if i <= max_history_images:
+        if i <= MAX_HISTORY_IMAGES:
             idxs = list(range(i + 1))
         else:
             idxs = np.linspace(0, i, 9, dtype=int).tolist()
@@ -140,12 +195,12 @@ def main():
     act_map_dagger_rxr = ["STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"]
 
     # --- R2R Dataset ---
-    img_root_r2r = "data/trajectory_data/R2R/train"
-    json_path_r2r = "data/datasets/r2r/train/train.json.gz"
-    
+    img_root_r2r = "/data/datasets/data/trajectory_data/R2R/train"
+    json_path_r2r = "/data/datasets/data/datasets/r2r/train/train.json.gz"
+
     # --- RxR Dataset ---
-    img_root_rxr = "data/trajectory_data/RxR/train"
-    json_path_rxr = "data/datasets/rxr/train/train_guide.json.gz"
+    img_root_rxr = "/data/datasets/data/trajectory_data/RxR/train"
+    json_path_rxr = "/data/datasets/data/datasets/rxr/train/train_guide.json.gz"
 
     print("Loading JSON data...")
 

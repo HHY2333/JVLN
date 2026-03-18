@@ -30,6 +30,37 @@ VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
+# ===========================================================================
+# 渐进式记忆压缩工具函数（与 modeling_qwen2_5_vl.py 中保持一致）
+# Progressive Memory Compression Utility (must stay in sync with model code)
+#
+# 论文：Efficient-VLN, Section 3.3 "Progressive Memory Representation"
+# 历史帧按时间远近分组，近期帧 2×2 压缩，远期帧递增压缩（4×4, 8×8...）
+# History frames grouped by temporal distance: nearest→2×2, older→4×4, oldest→8×8...
+# 当前帧（最后一帧）不压缩。Current frame (last) is not compressed.
+# ===========================================================================
+def get_progressive_compression_ratio(
+    pos_from_current: int,
+    memory_group_size: int = 3,
+    max_compression_order: int = 3,
+) -> int:
+    """
+    计算历史帧的渐进式空间压缩比。
+    与 modeling_qwen2_5_vl.py 中的同名函数保持完全一致，
+    确保 data_qwen.py 生成的 token 数与 model forward() 中压缩后的 token 数一致。
+
+    Args:
+        pos_from_current: 历史帧与当前帧的距离（0 = 最近历史帧）
+        memory_group_size: K，每组帧数（默认 3）
+        max_compression_order: 最大压缩阶数（默认 3，即最大 8×8）
+
+    Returns:
+        压缩因子 r（历史帧在高、宽两个维度各下采样 r 倍）
+    """
+    group = pos_from_current // memory_group_size
+    compression_order = min(group + 1, max_compression_order)
+    return 2 ** compression_order
+
 local_rank = None
 
 
@@ -263,10 +294,11 @@ class LazySupervisedDataset(Dataset):
 
     def process_image_unified_vggt(self, image_file):
         # this function reshapes the image to the width size of 518
-        image_processor = copy.deepcopy(self.data_args.image_processor)
+        # 直接读取属性，避免每张图都 deepcopy 整个 image_processor（含大量配置）
+        image_processor = self.data_args.image_processor
         from qwen_vl.model.vggt.utils.load_fn import load_and_preprocess_images
         images = load_and_preprocess_images([image_file])
-        images_vggt = copy.deepcopy(images[0])
+        images_vggt = images[0].clone()  # clone 比 deepcopy 快数倍
         merge_size: int = getattr(image_processor, "merge_size")
         patch_size: int = getattr(image_processor, "patch_size")
         _, height, width = images[0].shape
@@ -480,23 +512,87 @@ class LazySupervisedDataset(Dataset):
                 # image_file = os.path.join(image_folder, image_file)
                 # image, grid_thw = self.process_image_unified(image_file)
                 # image = [image]
-            grid_thw_merged = copy.deepcopy(grid_thw)
+
+            # -----------------------------------------------------------------------
+            # 渐进式记忆 token 数量计算（Progressive Memory Token Count Computation）
+            # 论文 Efficient-VLN Section 3.3：
+            #
+            # 关键设计：data_qwen.py 中计算的压缩后 token 数必须与
+            # modeling_qwen2_5_vl.py forward() 中实际压缩后得到的 token 数完全一致，
+            # 否则 input_ids 中 <image_pad> 数量与 image_embeds 行数不匹配。
+            #
+            # 策略：
+            #   - image_grid_thw（全分辨率）：传给视觉编码器，用于原始 patch 处理
+            #   - grid_thw_compressed（压缩后）：用于计算 <image_pad> token 数和 position_ids
+            #
+            # 压缩规则（与模型侧 get_progressive_compression_ratio 完全一致）：
+            #   - 最后一张图 = 当前帧，不压缩（r=1）
+            #   - 其余图 = 历史帧，按距当前帧的远近分组递增压缩
+            #     - 最近 K 帧（group 0）: r=2 → h_c = h_merged // 2
+            #     - 次近 K 帧（group 1）: r=4 → h_c = h_merged // 4
+            #     - 更早帧（group n）:   r=2^(n+1)（上限 2^max_order）
+            # -----------------------------------------------------------------------
+            merge_size = self.data_args.image_processor.merge_size
+
+            # 确保 grid_thw 为列表形式
             if not isinstance(grid_thw, Sequence):
-                grid_thw_merged = [grid_thw_merged]
                 grid_thw = [grid_thw]
+
+            # 超参数：与模型配置 memory_group_size / memory_max_compression_order 保持一致
+            # Hyperparams: must match model config memory_group_size / memory_max_compression_order
+            MEMORY_GROUP_SIZE = getattr(self.data_args, "memory_group_size", 4)          # K=4，与 modeling 默认值一致
+            MEMORY_MAX_COMPRESSION_ORDER = getattr(self.data_args, "memory_max_compression_order", 3)
+
+            n_total_images = len(grid_thw)
+
+            # 为每张图生成压缩后的 grid（用于 tokenization 和 position_ids）
+            # Build compressed grid_thw for each image (for tokenization and position_ids)
+            grid_thw_compressed = []
+            for idx_img, thw in enumerate(grid_thw):
+                if idx_img == n_total_images - 1:
+                    # 当前帧（最后一帧）：不压缩
+                    # Current frame (last): no compression
+                    grid_thw_compressed.append(thw.clone())
+                else:
+                    # 历史帧：根据距当前帧的位置计算压缩比
+                    # History frame: compute compression ratio based on distance from current
+                    pos = n_total_images - 2 - idx_img  # 0 = 最近历史帧
+                    r = get_progressive_compression_ratio(
+                        pos, MEMORY_GROUP_SIZE, MEMORY_MAX_COMPRESSION_ORDER
+                    )
+                    T, H_p, W_p = thw.tolist()
+                    # 压缩后的空间尺寸（与模型侧 adaptive_avg_pool2d 结果对齐）
+                    # Compressed spatial dims (aligned with model's adaptive_avg_pool2d result)
+                    h_m = H_p // merge_size          # merge 后的高度（patch 单位）
+                    w_m = W_p // merge_size          # merge 后的宽度（patch 单位）
+                    h_c = max(1, h_m // r)           # 压缩后高度
+                    w_c = max(1, w_m // r)           # 压缩后宽度
+                    # 重新编码为 grid_thw 格式：使 T * H_c * W_c // merge_size^2 = T * h_c * w_c
+                    # Re-encode in grid_thw format so token count = T * h_c * w_c
+                    H_c = h_c * merge_size
+                    W_c = w_c * merge_size
+                    grid_thw_compressed.append(torch.tensor([T, H_c, W_c], dtype=thw.dtype))
+
+            # 基于压缩后 grid 计算每张图的 token 数（即 input_ids 中 <image_pad> 的数量）
+            # Compute per-image token count based on COMPRESSED grid (= <image_pad> count in input_ids)
             grid_thw_merged = [
-                merged_thw.prod() // self.data_args.image_processor.merge_size**2
-                for merged_thw in grid_thw_merged
+                int(compressed_thw.prod() // merge_size ** 2)
+                for compressed_thw in grid_thw_compressed
             ]
+
             sources = copy.deepcopy([e["conversations"] for e in sources])
             data_dict = preprocess_qwen_2_visual(
                 sources, self.tokenizer, grid_thw=grid_thw_merged, visual_type="image"
             )
+
+            # position_ids 使用压缩后的 grid，使 RoPE 位置编码与实际 token 数一致
+            # Use COMPRESSED grid for position_ids so RoPE position encoding matches actual token count
             position_ids, _ = self.get_rope_index(
-                self.data_args.image_processor.merge_size,
+                merge_size,
                 data_dict["input_ids"],
-                torch.stack(grid_thw, dim=0),
+                torch.stack(grid_thw_compressed, dim=0),  # 压缩后 grid（非全分辨率）
             )
+
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
             video_folder = self.list_data_dict[i]["data_path"]
@@ -754,9 +850,17 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         batch["video_grid_thw"] = video_grid_thw
 
                 
-        # assume all data in a batch has images_vggt
+        # -----------------------------------------------------------------------
+        # 序列打包模式下的 images_vggt 处理
+        # images_vggt 是 List[Tensor]，每个元素形状 [n_frames, C, H, W]，
+        # forward() 按 batch index 逐个取用，因此保持 list 结构即可，
+        # 不需要 cat/pad（帧数不同，无法直接 stack）。
+        # tag 也保持 list 形式，与 images_vggt 一一对应。
+        # -----------------------------------------------------------------------
         if "images_vggt" in instances[0]:
-            raise NotImplementedError("FlattenedDataCollatorForSupervisedDataset does not support images_vggt")
+            images_vggt = [torch.stack(instance["images_vggt"]) for instance in instances]
+            batch["images_vggt"] = images_vggt
+            batch["tag"] = instances[0]["tag"]  # 打包后同一 batch 标签应一致
 
         return batch
 

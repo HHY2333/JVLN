@@ -104,6 +104,24 @@ def train(attn_implementation="flash_attention_2"):
         (ModelArguments, DataArguments, TrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # -----------------------------------------------------------------------
+    # 分段训练 + 全局进度条（Staged Training + Global Progress Bar）
+    #
+    # 设计：
+    #   - max_steps = total_steps（全局总步数），tqdm 进度条因此显示 "6/30000"
+    #   - EarlyStopAtStepCallback 监听 stop_at_step，到达后立即停止本段训练
+    #   - 下一段续训时从 checkpoint 继续，state.global_step 自动延续
+    #
+    # 这样进度条始终显示全局进度，无多余 print 输出。
+    # -----------------------------------------------------------------------
+    if training_args.total_steps > 0:
+        # 将 max_steps 设为全局总步数，tqdm 显示 X/total_steps
+        training_args.max_steps = training_args.total_steps
+    elif training_args.stop_at_step > 0:
+        # 未提供 total_steps 时退化：max_steps = stop_at_step（旧行为）
+        training_args.max_steps = training_args.stop_at_step
+
     set_seed(training_args.seed)
     # enable_full_determinism(training_args.seed)
 
@@ -166,8 +184,41 @@ def train(attn_implementation="flash_attention_2"):
         model.model.print_trainable_parameters()
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+
+    # -----------------------------------------------------------------------
+    # 分段早停 Callback（Early Stop for Staged Training）
+    #
+    # 设计：max_steps = total_steps（让 tqdm 显示全局进度 X/30000）。
+    # 但每段只训到 stop_at_step，之后 shell 脚本接管评估 + 续训。
+    # EarlyStopAtStepCallback 在 global_step 到达 stop_at_step 时置
+    # control.should_training_stop = True，Trainer 即刻保存并退出。
+    #
+    # 效果：tqdm 显示 "1006/30000"，每段训完自动停止，无额外 print 输出。
+    # -----------------------------------------------------------------------
+    from transformers import TrainerCallback
+
+    class EarlyStopAtStepCallback(TrainerCallback):
+        """在 global_step == stop_at_step 时停止本段训练（让 tqdm 显示全局进度）"""
+
+        def __init__(self, stop_at_step: int):
+            self.stop_at_step = stop_at_step  # 本段停止的全局步数
+
+        def on_step_end(self, args, state, control, **kwargs):
+            # state.global_step 续训时自动从 checkpoint 步数延续，无需手动偏移
+            if self.stop_at_step > 0 and state.global_step >= self.stop_at_step:
+                control.should_training_stop = True  # Trainer 下一轮检查时退出
+            return control
+
+    _callbacks = []
+    if training_args.stop_at_step > 0:
+        _callbacks.append(EarlyStopAtStepCallback(training_args.stop_at_step))
+
     trainer = Trainer(
-        model=model, processing_class=tokenizer, args=training_args, **data_module
+        model=model,
+        processing_class=tokenizer,
+        args=training_args,
+        callbacks=_callbacks if _callbacks else None,
+        **data_module,
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):

@@ -52,11 +52,11 @@ SCAN2CAP = {
 }
 
 
-# TRAIN_R2R_RxR = {
-#     "annotation_path": "path-to-train_r2r_rxr.json",
-#     "data_path": "",
-#     "tag": "train_r2r_rxr"
-# }
+TRAIN_R2R_RxR = {
+    "annotation_path": "/data/HuHuaiyang/JVLN/train_r2r_rxr.json",
+    "data_path": "/data/HuHuaiyang/JVLN/train_r2r_rxr.json",
+    "tag": "train_r2r_rxr"
+}
 
 
 # TRAIN_R2R_RxR_EXTRA = {
@@ -75,7 +75,7 @@ data_dict = {
     "scannet_det": SCANNET_DET,
     "scanrefer": SCANREFER,
     "scan2cap": SCAN2CAP,
-    # "train_r2r_rxr": TRAIN_R2R_RxR,
+    "train_r2r_rxr": TRAIN_R2R_RxR,
     # "train_r2r_rxr_extra": TRAIN_R2R_RxR_EXTRA
 }
 
